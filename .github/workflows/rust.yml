@@ -29,6 +29,3 @@ jobs:
         with:
           generate_release_notes: true
           files: target/release/*.exe
-        with:
-          generate_release_notes: true
-          files: target/release/*.exe
