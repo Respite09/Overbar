@@ -1,0 +1,20 @@
+# Rust build output
+/target/
+**/*.rs.bk
+*.pdb
+
+# Local editor and agent state
+/.vscode/
+/.idea/
+/.codex/
+/.agents/
+
+# Local logs and temporary files
+*.log
+*.tmp
+*.bak
+
+# Windows and macOS metadata
+Thumbs.db
+Desktop.ini
+.DS_Store
