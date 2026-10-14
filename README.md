@@ -11,7 +11,7 @@ A lightweight native Windows topbar and tiling window manager written in Rust.
 - native Windows acrylic blur
 - live CPU/RAM/temperature (if supported), battery, storage, network, task, volume, and clock panels
 - app launcher and indexed search
-- cool topbar
+- cool topbar :3
 
 ## Window-manager bindings
 
