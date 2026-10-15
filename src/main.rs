@@ -25,7 +25,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
@@ -52,6 +52,7 @@ const PANEL_HEIGHT: f32 = 225.0;
 const PANEL_GAP: f32 = 6.0;
 const PANEL_OPEN_SECONDS: f32 = 0.2;
 const POWER_PANEL_FADE_SECONDS: f32 = 0.22;
+const POWER_ACTION_DELAY_SECONDS: u32 = 3;
 const APPS_PANEL_WIDTH: f32 = 440.0;
 const APPS_PANEL_HEIGHT: f32 = 390.0;
 const WM_SETTINGS_PANEL_HEIGHT: f32 = 520.0;
@@ -60,6 +61,7 @@ const SEARCH_PANEL_WIDTH: f32 = 520.0;
 const SEARCH_PANEL_HEIGHT: f32 = 330.0;
 const SEARCH_PANEL_OPEN_SECONDS: f32 = 0.18;
 const SEARCH_PANEL_CLOSE_SECONDS: f32 = 0.13;
+const BAR_SLIDE_SECONDS: f32 = 0.18;
 const TEXT_PRIMARY: Color32 = Color32::from_rgb(225, 231, 236);
 const TEXT_MUTED: Color32 = Color32::from_rgb(180, 193, 201);
 const STAT_LABEL: Color32 = Color32::from_rgba_premultiplied(127, 136, 142, 180);
@@ -100,8 +102,8 @@ fn trigger_power_action(action: PowerAction) {
             System::{
                 Power::SetSuspendState,
                 Shutdown::{
-                    EWX_FORCEIFHUNG, EWX_LOGOFF, EWX_POWEROFF, EWX_REBOOT, ExitWindowsEx,
-                    LockWorkStation, SHUTDOWN_REASON,
+                    EWX_FORCEIFHUNG, EWX_LOGOFF, ExitWindowsEx, LockWorkStation,
+                    SHUTDOWN_REASON,
                 },
             },
         };
@@ -117,10 +119,10 @@ fn trigger_power_action(action: PowerAction) {
                 let _ = SetSuspendState(true, false, false);
             }
             PowerAction::Shutdown => {
-                let _ = ExitWindowsEx(EWX_POWEROFF | EWX_FORCEIFHUNG, SHUTDOWN_REASON(0));
+                let _ = schedule_system_power_action(PowerAction::Shutdown, 0);
             }
             PowerAction::Restart => {
-                let _ = ExitWindowsEx(EWX_REBOOT | EWX_FORCEIFHUNG, SHUTDOWN_REASON(0));
+                let _ = schedule_system_power_action(PowerAction::Restart, 0);
             }
             PowerAction::SignOut => {
                 let _ = ExitWindowsEx(EWX_LOGOFF | EWX_FORCEIFHUNG, SHUTDOWN_REASON(0));
@@ -130,6 +132,30 @@ fn trigger_power_action(action: PowerAction) {
 
     #[cfg(not(target_os = "windows"))]
     let _ = action;
+}
+
+#[cfg(target_os = "windows")]
+fn schedule_system_power_action(action: PowerAction, delay_seconds: u32) -> bool {
+    let operation = match action {
+        PowerAction::Shutdown => "/s",
+        PowerAction::Restart => "/r",
+        _ => return false,
+    };
+    let mut command = Command::new("shutdown.exe");
+    command.args([
+        operation,
+        "/f",
+        "/t",
+        &delay_seconds.to_string(),
+    ]);
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    hide_child_console(&mut command);
+    command.spawn().is_ok()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn schedule_system_power_action(_action: PowerAction, _delay_seconds: u32) -> bool {
+    false
 }
 
 fn smootherstep(value: f32) -> f32 {
@@ -266,6 +292,17 @@ enum TilingDirection {
     Vertical,
 }
 
+const DEFAULT_WM_GAP: i32 = 18;
+const DEFAULT_MEDIA_NAME_WIDTH: f32 = 210.0;
+
+fn default_wm_gap() -> i32 {
+    DEFAULT_WM_GAP
+}
+
+fn default_media_name_width() -> f32 {
+    DEFAULT_MEDIA_NAME_WIDTH
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct WmConfig {
     #[serde(default = "default_wm_keybindings")]
@@ -276,6 +313,10 @@ struct WmConfig {
     window_floating_states: HashMap<String, bool>,
     #[serde(default)]
     centered_window_types: HashSet<String>,
+    #[serde(default = "default_wm_gap")]
+    window_gap: i32,
+    #[serde(default = "default_media_name_width")]
+    media_name_width: f32,
 }
 
 impl Default for WmConfig {
@@ -285,6 +326,8 @@ impl Default for WmConfig {
             ignore_minimum_size_apps: Vec::new(),
             window_floating_states: HashMap::new(),
             centered_window_types: HashSet::new(),
+            window_gap: default_wm_gap(),
+            media_name_width: default_media_name_width(),
         }
     }
 }
@@ -295,7 +338,8 @@ fn default_wm_keybindings() -> HashMap<String, String> {
         ("Focus up", "Alt+K"), ("Focus down", "Alt+J"),
         ("Move left", "Alt+Shift+H"), ("Move right", "Alt+Shift+L"),
         ("Move up", "Alt+Shift+K"), ("Move down", "Alt+Shift+J"),
-        ("Tiling direction", "Alt+V"), ("Toggle floating", "Alt+T"),
+        ("Tiling direction", "Alt+V"), ("Set Tiled", "Alt+T"),
+        ("Cycle tiled/floating", "Alt+Shift+Space"),
         ("Fullscreen", "Alt+F"), ("Minimize", "Alt+M"),
         ("Close", "Alt+Shift+Q"), ("Previous workspace", "Alt+A"),
         ("Next workspace", "Alt+S"), ("Recent workspace", "Alt+D"),
@@ -308,8 +352,10 @@ enum WindowManagerUpdate {
     Workspaces(WorkspacesState),
     TilingDirection(TilingDirection),
     Floating(bool),
+    ResizeMode(bool),
     LayoutChanged,
     ConfigChanged(WmConfig),
+    BarVisibility(bool),
 }
 
 #[derive(Clone, Debug)]
@@ -370,7 +416,20 @@ enum AudioCommand {
     SetVolume(f32),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
+struct MediaState {
+    title: String,
+    artist: String,
+    playing: bool,
+    position_seconds: f64,
+    duration_seconds: f64,
+}
+
+enum MediaCommand {
+    TogglePlayPause,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PowerAction {
     Lock,
     Sleep,
@@ -394,6 +453,18 @@ struct OverbarApp {
     temperature_updates: Receiver<Option<f32>>,
     audio_updates: Receiver<AudioState>,
     audio_commands: Sender<AudioCommand>,
+    media_updates: Receiver<Option<MediaState>>,
+    media_commands: Sender<MediaCommand>,
+    media: Option<MediaState>,
+    media_updated_at: Instant,
+    media_raw_position: Option<f64>,
+    media_icon_mix_from: f32,
+    media_icon_mix_to: f32,
+    media_icon_transition_started: Instant,
+    media_scroll_label: String,
+    media_scroll_started: Instant,
+    play_icon: TextureHandle,
+    pause_icon: TextureHandle,
     volume: f32,
     volume_muted: bool,
     volume_expanded: bool,
@@ -409,9 +480,12 @@ struct OverbarApp {
     power_panel_closing: bool,
     power_panel_opened_at: Instant,
     pending_power_action: Option<PowerAction>,
+    scheduled_power_action: Option<PowerAction>,
+    scheduled_power_action_started: Option<Instant>,
     power_button_rect: eframe::egui::Rect,
     lock_icon: TextureHandle,
     sleep_icon: TextureHandle,
+    restart_icon: TextureHandle,
     shutdown_icon: TextureHandle,
     wm_settings_open: bool,
     wm_settings_closing: bool,
@@ -441,14 +515,23 @@ struct OverbarApp {
     direction_angle_to: f32,
     direction_angle_started: Instant,
     focused_floating: bool,
+    resize_mode_active: bool,
     tiled_icon: TextureHandle,
     floating_icon: TextureHandle,
     last_metrics_refresh: Instant,
     search_active: bool,
     search_panel_closing: bool,
     search_panel_animation_started: Instant,
+    // Automatically opens and closes the search panel once, right at launch,
+    // so whatever one-time setup cost the first real search activation pays
+    // (focus-stealing, IME, GPU surface, etc.) happens during startup instead
+    // of during the user's own first Alt+Space.
+    // 0 = not started, 1 = opened and waiting to auto-close, 2 = done.
+    startup_search_warmup_stage: u8,
+    startup_search_warmup_started: Instant,
     search_query: String,
     search_focus_pending: bool,
+    search_focus_attempts: u8,
     search_selected: usize,
     search_scroll_to_selected: bool,
     search_text_transition_started: Instant,
@@ -468,14 +551,26 @@ struct OverbarApp {
     search_requests: Sender<SearchWorkerRequest>,
     search_updates: Receiver<SearchResults>,
     search_shortcuts: Receiver<()>,
+    last_bar_monitor_size: Option<Vec2>,
+    bar_auto_hidden: bool,
+    bar_slide_from: f32,
+    bar_slide_to: f32,
+    bar_slide_started: Instant,
+    last_bar_position_y: Option<f32>,
 }
 
 impl OverbarApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut visuals = eframe::egui::Visuals::dark();
         visuals.panel_fill = Color32::TRANSPARENT;
-        visuals.window_fill = Color32::TRANSPARENT;
-        cc.egui_ctx.set_visuals(visuals);
+        visuals.window_fill = Color32::from_rgba_unmultiplied(9, 11, 15, 172);
+        visuals.window_stroke = Stroke::NONE;
+        visuals.window_corner_radius = CornerRadius::same(5);
+        visuals.popup_shadow = eframe::egui::epaint::Shadow::NONE;
+        let mut style = (*cc.egui_ctx.style()).clone();
+        style.visuals = visuals;
+        style.spacing.menu_margin = Margin::symmetric(7, 4);
+        cc.egui_ctx.set_style(style);
         configure_fonts(&cc.egui_ctx);
 
         #[cfg(target_os = "windows")]
@@ -504,6 +599,10 @@ impl OverbarApp {
             cc.egui_ctx.clone(),
             Arc::clone(&runtime_running),
         );
+        let (media_commands, media_updates) = spawn_media_worker(
+            cc.egui_ctx.clone(),
+            Arc::clone(&runtime_running),
+        );
         let (search_requests, search_updates) = spawn_search_worker(cc.egui_ctx.clone());
         let stored_search_preferences = load_search_preferences();
         let search_home = search_home_results(&stored_search_preferences);
@@ -529,6 +628,16 @@ impl OverbarApp {
                 [24, 24],
                 include_bytes!("../assets/pin-filled.rgba"),
             ),
+            TextureOptions::LINEAR,
+        );
+        let play_icon = cc.egui_ctx.load_texture(
+            "overbar-play-svg",
+            ColorImage::from_rgba_unmultiplied([24, 24], include_bytes!("../assets/play.rgba")),
+            TextureOptions::LINEAR,
+        );
+        let pause_icon = cc.egui_ctx.load_texture(
+            "overbar-pause-svg",
+            ColorImage::from_rgba_unmultiplied([24, 24], include_bytes!("../assets/pause.rgba")),
             TextureOptions::LINEAR,
         );
         let tiled_icon = cc.egui_ctx.load_texture(
@@ -563,6 +672,14 @@ impl OverbarApp {
         let sleep_icon = cc.egui_ctx.load_texture(
             "overbar-sleep-svg",
             ColorImage::from_rgba_unmultiplied([96, 96], include_bytes!("../assets/sleep.rgba")),
+            TextureOptions::LINEAR,
+        );
+        let restart_icon = cc.egui_ctx.load_texture(
+            "overbar-restart-svg",
+            ColorImage::from_rgba_unmultiplied(
+                [96, 96],
+                include_bytes!("../assets/restart.rgba"),
+            ),
             TextureOptions::LINEAR,
         );
         let shutdown_icon = cc.egui_ctx.load_texture(
@@ -602,6 +719,18 @@ impl OverbarApp {
             temperature_updates,
             audio_updates,
             audio_commands,
+            media_updates,
+            media_commands,
+            media: None,
+            media_updated_at: Instant::now(),
+            media_raw_position: None,
+            media_icon_mix_from: 0.0,
+            media_icon_mix_to: 0.0,
+            media_icon_transition_started: Instant::now(),
+            media_scroll_label: String::new(),
+            media_scroll_started: Instant::now(),
+            play_icon,
+            pause_icon,
             volume: 0.0,
             volume_muted: false,
             volume_expanded: false,
@@ -617,9 +746,12 @@ impl OverbarApp {
             power_panel_closing: false,
             power_panel_opened_at: Instant::now(),
             pending_power_action: None,
+            scheduled_power_action: None,
+            scheduled_power_action_started: None,
             power_button_rect: eframe::egui::Rect::NOTHING,
             lock_icon,
             sleep_icon,
+            restart_icon,
             shutdown_icon,
             wm_settings_open: false,
             wm_settings_closing: false,
@@ -649,14 +781,18 @@ impl OverbarApp {
             direction_angle_to: 0.0,
             direction_angle_started: Instant::now(),
             focused_floating: false,
+            resize_mode_active: false,
             tiled_icon,
             floating_icon,
             last_metrics_refresh: Instant::now() - Duration::from_secs(1),
             search_active: false,
             search_panel_closing: false,
             search_panel_animation_started: Instant::now(),
+            startup_search_warmup_stage: 0,
+            startup_search_warmup_started: Instant::now(),
             search_query: String::new(),
             search_focus_pending: false,
+            search_focus_attempts: 0,
             search_selected: 0,
             search_scroll_to_selected: false,
             search_text_transition_started: Instant::now(),
@@ -676,6 +812,12 @@ impl OverbarApp {
             search_requests,
             search_updates,
             search_shortcuts,
+            last_bar_monitor_size: None,
+            bar_auto_hidden: false,
+            bar_slide_from: 0.0,
+            bar_slide_to: 0.0,
+            bar_slide_started: Instant::now(),
+            last_bar_position_y: None,
         }
     }
 
@@ -758,6 +900,7 @@ impl OverbarApp {
         play_launcher_open_sound();
         if self.search_active {
             self.search_focus_pending = true;
+            self.search_focus_attempts = 0;
             ctx.request_repaint();
             return;
         }
@@ -765,6 +908,7 @@ impl OverbarApp {
         self.search_panel_closing = false;
         self.search_panel_animation_started = Instant::now();
         self.search_focus_pending = true;
+        self.search_focus_attempts = 0;
         self.search_selected = 0;
         self.search_scroll_to_selected = false;
         self.search_text_transition_started = Instant::now();
@@ -851,6 +995,7 @@ impl OverbarApp {
         self.search_panel_closing = true;
         self.search_panel_animation_started = Instant::now();
         self.search_focus_pending = false;
+        self.search_focus_attempts = 0;
         self.search_selected = 0;
         self.search_text_transition_started = Instant::now();
         set_search_keyboard_focus(false, restore_previous_focus);
@@ -1031,6 +1176,11 @@ impl OverbarApp {
     }
 
     fn draw_search_panel(&mut self, ctx: &Context, monitor_width: f32) {
+        // Windows' blur-behind backdrop is a compositor-level effect tied to the
+        // HWND's rect; it renders regardless of our own content alpha. So the
+        // panel must be parked off-screen while closed - opacity alone cannot
+        // hide it, as proven by the frosted rectangle that stayed visible when
+        // it was kept at its on-screen slot permanently.
         let panel_is_visible = self.search_active || self.search_panel_closing;
         let panel_builder = ViewportBuilder::default()
             .with_title("Overbar Search Panel")
@@ -1672,67 +1822,80 @@ impl OverbarApp {
         }
 
         ui.add_space(9.0);
-        let turn_progress = (now
-            .duration_since(self.direction_angle_started)
-            .as_secs_f32()
-            / DIRECTION_TURN_SECONDS)
-            .clamp(0.0, 1.0);
-        let direction_angle = self.direction_angle_from
-            + (self.direction_angle_to - self.direction_angle_from)
-                * smootherstep(turn_progress);
-        if turn_progress < 1.0 {
-            ui.ctx().request_repaint();
-        }
-        let (arrow_rect, arrow_response) =
-            ui.allocate_exact_size(Vec2::new(10.0, 15.0), Sense::click());
-        let arrow_response = arrow_response.on_hover_cursor(CursorIcon::PointingHand);
-        let rotate = |point: Vec2| {
-            Vec2::new(
-                point.x * direction_angle.cos() - point.y * direction_angle.sin(),
-                point.x * direction_angle.sin() + point.y * direction_angle.cos(),
-            )
-        };
-        let arrow_center = arrow_rect.center();
-        let arrow_stroke = Stroke::new(1.45_f32, TEXT_PRIMARY);
-        ui.painter().line_segment(
-            [
-                arrow_center + rotate(Vec2::new(-2.0, -3.0)),
-                arrow_center + rotate(Vec2::new(1.5, 0.0)),
-            ],
-            arrow_stroke,
-        );
-        ui.painter().line_segment(
-            [
-                arrow_center + rotate(Vec2::new(1.5, 0.0)),
-                arrow_center + rotate(Vec2::new(-2.0, 3.0)),
-            ],
-            arrow_stroke,
-        );
-        if arrow_response.clicked() {
-            self.toggle_tiling_direction(direction_angle);
-        }
-        ui.add_space(7.0);
-        let (mode_rect, mode_response) = ui.allocate_exact_size(Vec2::splat(15.0), Sense::click());
-        let mode_response = mode_response.on_hover_cursor(CursorIcon::PointingHand);
-        let mode_icon = if self.focused_floating {
-            &self.floating_icon
+        if self.resize_mode_active {
+            let (resize_rect, _) =
+                ui.allocate_exact_size(Vec2::new(32.0, 15.0), Sense::hover());
+            ui.painter().text(
+                resize_rect.center(),
+                eframe::egui::Align2::CENTER_CENTER,
+                "resize",
+                FontId::monospace(9.0),
+                self.accent_color,
+            );
         } else {
-            &self.tiled_icon
-        };
-        ui.painter().image(
-            mode_icon.id(),
-            eframe::egui::Rect::from_center_size(mode_rect.center(), Vec2::splat(14.0)),
-            eframe::egui::Rect::from_min_max(
-                eframe::egui::Pos2::ZERO,
-                eframe::egui::pos2(1.0, 1.0),
-            ),
-            TEXT_PRIMARY,
-        );
-        if mode_response.clicked() {
-            let _ = self
-                .window_manager_commands
-                .send(WindowManagerCommand::ToggleFloating);
-            self.focused_floating = !self.focused_floating;
+            let turn_progress = (now
+                .duration_since(self.direction_angle_started)
+                .as_secs_f32()
+                / DIRECTION_TURN_SECONDS)
+                .clamp(0.0, 1.0);
+            let direction_angle = self.direction_angle_from
+                + (self.direction_angle_to - self.direction_angle_from)
+                    * smootherstep(turn_progress);
+            if turn_progress < 1.0 {
+                ui.ctx().request_repaint();
+            }
+            let (arrow_rect, arrow_response) =
+                ui.allocate_exact_size(Vec2::new(10.0, 15.0), Sense::click());
+            let arrow_response = arrow_response.on_hover_cursor(CursorIcon::PointingHand);
+            let rotate = |point: Vec2| {
+                Vec2::new(
+                    point.x * direction_angle.cos() - point.y * direction_angle.sin(),
+                    point.x * direction_angle.sin() + point.y * direction_angle.cos(),
+                )
+            };
+            let arrow_center = arrow_rect.center();
+            let arrow_stroke = Stroke::new(1.45_f32, TEXT_PRIMARY);
+            ui.painter().line_segment(
+                [
+                    arrow_center + rotate(Vec2::new(-2.0, -3.0)),
+                    arrow_center + rotate(Vec2::new(1.5, 0.0)),
+                ],
+                arrow_stroke,
+            );
+            ui.painter().line_segment(
+                [
+                    arrow_center + rotate(Vec2::new(1.5, 0.0)),
+                    arrow_center + rotate(Vec2::new(-2.0, 3.0)),
+                ],
+                arrow_stroke,
+            );
+            if arrow_response.clicked() {
+                self.toggle_tiling_direction(direction_angle);
+            }
+            ui.add_space(7.0);
+            let (mode_rect, mode_response) =
+                ui.allocate_exact_size(Vec2::splat(15.0), Sense::click());
+            let mode_response = mode_response.on_hover_cursor(CursorIcon::PointingHand);
+            let mode_icon = if self.focused_floating {
+                &self.floating_icon
+            } else {
+                &self.tiled_icon
+            };
+            ui.painter().image(
+                mode_icon.id(),
+                eframe::egui::Rect::from_center_size(mode_rect.center(), Vec2::splat(14.0)),
+                eframe::egui::Rect::from_min_max(
+                    eframe::egui::Pos2::ZERO,
+                    eframe::egui::pos2(1.0, 1.0),
+                ),
+                TEXT_PRIMARY,
+            );
+            if mode_response.clicked() {
+                let _ = self
+                    .window_manager_commands
+                    .send(WindowManagerCommand::ToggleFloating);
+                self.focused_floating = !self.focused_floating;
+            }
         }
         ui.add_space(10.0);
 
@@ -1880,6 +2043,187 @@ impl OverbarApp {
             }
             self.focus_workspace(&name);
         }
+
+        if self.media.is_some() {
+            ui.add_space(10.0);
+            self.draw_media_pill(ui);
+        }
+    }
+
+    fn draw_media_pill(&mut self, ui: &mut eframe::egui::Ui) {
+        let Some(media) = self.media.clone() else {
+            return;
+        };
+        let label = if media.artist.trim().is_empty() {
+            media.title.clone()
+        } else {
+            format!("{} - {}", media.artist.trim(), media.title.trim())
+        };
+        let font = FontId::monospace(BAR_FONT_SIZE);
+        let text_width = ui
+            .painter()
+            .layout_no_wrap(label.clone(), font.clone(), TEXT_PRIMARY)
+            .size()
+            .x;
+        if self.media_scroll_label != label {
+            self.media_scroll_label = label.clone();
+            self.media_scroll_started = Instant::now();
+        }
+        let configured_text_width = self.wm_config.media_name_width.clamp(80.0, 500.0);
+        let width = (40.0 + text_width.min(configured_text_width)).max(112.0);
+        let height = PILL_CONTENT_HEIGHT + 6.0;
+        let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
+        let response = response.on_hover_cursor(CursorIcon::PointingHand);
+        let hover = ui.ctx().animate_bool_with_time(
+            ui.id().with("media-pill-hover"),
+            response.hovered(),
+            0.14,
+        );
+        ui.painter().rect_filled(
+            rect,
+            CornerRadius::same(18),
+            Color32::from_rgba_unmultiplied(9, 11, 15, (92.0 + 26.0 * hover) as u8),
+        );
+
+        let icon_rect = eframe::egui::Rect::from_center_size(
+            eframe::egui::pos2(rect.left() + 17.0, rect.center().y - 0.5),
+            Vec2::splat(15.0),
+        );
+        let icon_mix = self.current_media_icon_mix();
+        let play_rect = eframe::egui::Rect::from_center_size(
+            icon_rect.center(),
+            Vec2::splat(15.0 - icon_mix * 1.5),
+        );
+        let pause_rect = eframe::egui::Rect::from_center_size(
+            icon_rect.center(),
+            Vec2::splat(13.5 + icon_mix * 1.5),
+        );
+        ui.painter().image(
+            self.play_icon.id(),
+            play_rect,
+            eframe::egui::Rect::from_min_max(
+                eframe::egui::Pos2::ZERO,
+                eframe::egui::pos2(1.0, 1.0),
+            ),
+            TEXT_MUTED.gamma_multiply(1.0 - icon_mix),
+        );
+        ui.painter().image(
+            self.pause_icon.id(),
+            pause_rect,
+            eframe::egui::Rect::from_min_max(
+                eframe::egui::Pos2::ZERO,
+                eframe::egui::pos2(1.0, 1.0),
+            ),
+            TEXT_MUTED.gamma_multiply(icon_mix),
+        );
+
+        let text_rect = eframe::egui::Rect::from_min_max(
+            eframe::egui::pos2(rect.left() + 31.0, rect.top()),
+            eframe::egui::pos2(rect.right() - 9.0, rect.bottom() - 2.0),
+        );
+        let text_painter = ui.painter().with_clip_rect(text_rect);
+        if text_width > text_rect.width() + 0.5 {
+            const MARQUEE_DELAY_SECONDS: f32 = 0.85;
+            const MARQUEE_SPEED: f32 = 28.0;
+            const MARQUEE_GAP: f32 = 36.0;
+            let elapsed = self.media_scroll_started.elapsed().as_secs_f32();
+            let offset = if elapsed <= MARQUEE_DELAY_SECONDS {
+                0.0
+            } else {
+                ((elapsed - MARQUEE_DELAY_SECONDS) * MARQUEE_SPEED)
+                    % (text_width + MARQUEE_GAP)
+            };
+            for x in [
+                text_rect.left() - offset,
+                text_rect.left() - offset + text_width + MARQUEE_GAP,
+            ] {
+                text_painter.text(
+                    eframe::egui::pos2(x, rect.center().y - 0.5),
+                    eframe::egui::Align2::LEFT_CENTER,
+                    &label,
+                    font.clone(),
+                    TEXT_PRIMARY,
+                );
+            }
+            ui.ctx().request_repaint_after(Duration::from_millis(16));
+        } else {
+            text_painter.text(
+                eframe::egui::pos2(text_rect.left(), rect.center().y - 0.5),
+                eframe::egui::Align2::LEFT_CENTER,
+                label,
+                font,
+                TEXT_PRIMARY,
+            );
+        }
+
+        let elapsed = if media.playing {
+            self.media_updated_at.elapsed().as_secs_f64()
+        } else {
+            0.0
+        };
+        let progress = if media.duration_seconds > 0.0 {
+            ((media.position_seconds + elapsed) / media.duration_seconds).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let track = eframe::egui::Rect::from_min_max(
+            eframe::egui::pos2(rect.left() + 12.0, rect.bottom() - 1.5),
+            eframe::egui::pos2(rect.right() - 12.0, rect.bottom() - 0.5),
+        );
+        ui.painter().rect_filled(
+            track,
+            CornerRadius::same(1),
+            Color32::from_rgba_unmultiplied(0, 0, 0, 55),
+        );
+        if progress > 0.0 {
+            let progress_rect = eframe::egui::Rect::from_min_max(
+                track.min,
+                eframe::egui::pos2(track.left() + track.width() * progress as f32, track.bottom()),
+            );
+            ui.painter().rect_filled(
+                progress_rect,
+                CornerRadius::same(1),
+                self.accent_color,
+            );
+        }
+
+        if media.playing || (self.media_icon_mix_to - icon_mix).abs() > 0.001 {
+            ui.ctx().request_repaint_after(Duration::from_millis(16));
+        }
+        if response.clicked() {
+            let _ = self.media_commands.send(MediaCommand::TogglePlayPause);
+            self.animate_media_icon_to(!media.playing);
+            if let Some(current) = self.media.as_mut() {
+                if current.playing {
+                    current.position_seconds = (current.position_seconds
+                        + self.media_updated_at.elapsed().as_secs_f64())
+                        .min(current.duration_seconds.max(0.0));
+                }
+                current.playing = !current.playing;
+            }
+            self.media_updated_at = Instant::now();
+            ui.ctx().request_repaint();
+        }
+    }
+
+    fn current_media_icon_mix(&self) -> f32 {
+        let progress = (self.media_icon_transition_started.elapsed().as_secs_f32() / 0.18)
+            .clamp(0.0, 1.0);
+        let eased = progress * progress * (3.0 - 2.0 * progress);
+        self.media_icon_mix_from
+            + (self.media_icon_mix_to - self.media_icon_mix_from) * eased
+    }
+
+    fn animate_media_icon_to(&mut self, playing: bool) {
+        let target = if playing { 1.0 } else { 0.0 };
+        let current = self.current_media_icon_mix();
+        if (target - self.media_icon_mix_to).abs() > f32::EPSILON
+            || (current - target).abs() > 0.001
+        {
+            self.media_icon_mix_from = current;
+            self.media_icon_mix_to = target;
+            self.media_icon_transition_started = Instant::now();
+        }
     }
 
     fn draw_right(&mut self, ui: &mut eframe::egui::Ui) {
@@ -1901,8 +2245,7 @@ impl OverbarApp {
         self.power_button_rect = power_rect;
         let power_response = ui
             .interact(power_rect, ui.id().with("power-button"), Sense::click())
-            .on_hover_cursor(CursorIcon::PointingHand)
-            .on_hover_text("Power options");
+            .on_hover_cursor(CursorIcon::PointingHand);
         let hover_tint = if power_response.hovered() {
             Color32::from_rgba_unmultiplied(
                 power_color.r(),
@@ -1922,7 +2265,10 @@ impl OverbarApp {
             hover_tint,
         );
         if power_response.clicked() {
-            if self.power_panel_open {
+            if self.scheduled_power_action.is_some() {
+                // Keep the cancellation UI available until Windows accepts an
+                // abort request or completes the scheduled power action.
+            } else if self.power_panel_open {
                 self.begin_power_panel_close();
             } else {
                 self.power_panel_opened_at = Instant::now();
@@ -2207,6 +2553,27 @@ impl OverbarApp {
     }
 
     fn draw_power_panel(&mut self, ctx: &Context, monitor_size: Vec2) {
+        if let (Some(action), Some(started)) = (
+            self.scheduled_power_action,
+            self.scheduled_power_action_started,
+        ) && started.elapsed() >= Duration::from_secs(POWER_ACTION_DELAY_SECONDS as u64)
+        {
+            // Keep the cancellable countdown entirely inside Overbar. Calling
+            // shutdown.exe only after it expires with /t 0 avoids Windows'
+            // separate "You're about to be signed out" countdown dialog.
+            self.scheduled_power_action_started = None;
+            if !schedule_system_power_action(action, 0) {
+                self.scheduled_power_action = None;
+                record_startup_event(&format!(
+                    "failed to launch immediate {}",
+                    if action == PowerAction::Restart {
+                        "restart"
+                    } else {
+                        "shutdown"
+                    }
+                ));
+            }
+        }
         if self.power_panel_closing
             && self.power_panel_opened_at.elapsed()
                 >= Duration::from_secs_f32(POWER_PANEL_FADE_SECONDS)
@@ -2244,14 +2611,21 @@ impl OverbarApp {
 
         let lock_icon = self.lock_icon.id();
         let sleep_icon = self.sleep_icon.id();
+        let restart_icon = self.restart_icon.id();
         let shutdown_icon = self.shutdown_icon.id();
         let accent = self.accent_color;
+        let scheduled_action = self.scheduled_power_action;
+        let scheduled_action_can_cancel = self.scheduled_power_action_started.is_some();
         let mut action = None::<PowerAction>;
+        let mut cancel_requested = false;
         let mut close_requested = false;
         ctx.show_viewport_immediate(
             ViewportId::from_hash_of("overbar-power-menu"),
             panel_builder,
             |panel_ctx, _viewport_class| {
+                if panel_visible {
+                    panel_ctx.request_repaint_after(Duration::from_millis(16));
+                }
                 if panel_ctx.input(|input| input.viewport().close_requested()) {
                     close_requested = true;
                 }
@@ -2269,6 +2643,58 @@ impl OverbarApp {
                                 (92.0 * opacity).round() as u8,
                             ),
                         );
+
+                        if let Some(scheduled_action) = scheduled_action {
+                            let status = match scheduled_action {
+                                PowerAction::Shutdown => "Waiting for shutdown...",
+                                PowerAction::Restart => "Waiting for restart...",
+                                _ => "Waiting...",
+                            };
+                            ui.painter().text(
+                                screen.center() - Vec2::new(0.0, 22.0),
+                                eframe::egui::Align2::CENTER_CENTER,
+                                status,
+                                FontId::monospace(19.0),
+                                TEXT_PRIMARY.gamma_multiply(opacity),
+                            );
+
+                            if scheduled_action_can_cancel {
+                                let cancel_rect = eframe::egui::Rect::from_center_size(
+                                    screen.center() + Vec2::new(0.0, 30.0),
+                                    Vec2::new(116.0, 38.0),
+                                );
+                                let cancel_id = ui.id().with("cancel-scheduled-power-action");
+                                let cancel_response = ui
+                                    .interact(cancel_rect, cancel_id, Sense::click())
+                                    .on_hover_cursor(CursorIcon::PointingHand);
+                                let hover = ui.ctx().animate_bool_with_time(
+                                    cancel_id.with("hover"),
+                                    cancel_response.hovered(),
+                                    0.16,
+                                );
+                                ui.painter().rect_filled(
+                                    cancel_rect.expand(2.0 * hover),
+                                    CornerRadius::same(9),
+                                    Color32::from_rgba_unmultiplied(
+                                        9,
+                                        11,
+                                        15,
+                                        ((38.0 + 82.0 * hover) * opacity).round() as u8,
+                                    ),
+                                );
+                                ui.painter().text(
+                                    cancel_rect.center(),
+                                    eframe::egui::Align2::CENTER_CENTER,
+                                    "Cancel",
+                                    FontId::monospace(12.0),
+                                    TEXT_PRIMARY.gamma_multiply(opacity),
+                                );
+                                if cancel_response.clicked() {
+                                    cancel_requested = true;
+                                }
+                            }
+                            return;
+                        }
 
                         let back_rect = eframe::egui::Rect::from_min_size(
                             screen.min + Vec2::new(24.0, 22.0),
@@ -2304,10 +2730,10 @@ impl OverbarApp {
                             close_requested = true;
                         }
 
-                        let card_width = (screen.width() * 0.14).clamp(160.0, 210.0);
+                        let card_width = (screen.width() * 0.12).clamp(145.0, 190.0);
                         let card_height = (screen.height() * 0.22).clamp(170.0, 205.0);
-                        let gap = (screen.width() * 0.025).clamp(22.0, 42.0);
-                        let row_width = card_width * 3.0 + gap * 2.0;
+                        let gap = (screen.width() * 0.018).clamp(18.0, 34.0);
+                        let row_width = card_width * 4.0 + gap * 3.0;
                         let row_origin = eframe::egui::pos2(
                             screen.center().x - row_width / 2.0,
                             screen.center().y - card_height / 2.0
@@ -2316,6 +2742,7 @@ impl OverbarApp {
                         for (index, (label, icon, power_action, color)) in [
                             ("Lock", lock_icon, PowerAction::Lock, accent),
                             ("Sleep", sleep_icon, PowerAction::Sleep, accent),
+                            ("Restart", restart_icon, PowerAction::Restart, accent),
                             (
                                 "Shutdown",
                                 shutdown_icon,
@@ -2350,11 +2777,27 @@ impl OverbarApp {
             ensure_windows_overlay_topmost("Overbar Power Menu");
         }
 
-        if let Some(action) = action {
-            self.pending_power_action = Some(action);
-            close_requested = true;
+        if cancel_requested {
+            self.scheduled_power_action = None;
+            self.scheduled_power_action_started = None;
+            self.power_panel_open = true;
+            self.power_panel_closing = false;
+            self.power_panel_opened_at = Instant::now() -
+                Duration::from_secs_f32(POWER_PANEL_FADE_SECONDS);
         }
-        if close_requested {
+        if let Some(action) = action {
+            if matches!(action, PowerAction::Shutdown | PowerAction::Restart) {
+                self.scheduled_power_action = Some(action);
+                self.scheduled_power_action_started = Some(Instant::now());
+                self.pending_power_action = None;
+                self.power_panel_open = true;
+                self.power_panel_closing = false;
+            } else {
+                self.pending_power_action = Some(action);
+                close_requested = true;
+            }
+        }
+        if close_requested && self.scheduled_power_action.is_none() {
             self.begin_power_panel_close();
         }
         if panel_visible {
@@ -2456,8 +2899,14 @@ impl OverbarApp {
                                     );
                                 });
                                 ui.add_space(8.0);
+                                let footer_height = 32.0;
+                                let footer_gap = 6.0;
+                                let scroll_height =
+                                    (ui.available_height() - footer_height - footer_gap).max(1.0);
                                 ScrollArea::vertical()
                                     .auto_shrink([false, false])
+                                    .min_scrolled_height(scroll_height)
+                                    .max_height(scroll_height)
                                     .show(ui, |ui| {
                                         if apps.is_empty() {
                                             ui.label(
@@ -2526,8 +2975,7 @@ impl OverbarApp {
                                                         let info_response = info_response
                                                             .on_hover_cursor(
                                                                 CursorIcon::PointingHand,
-                                                            )
-                                                            .on_hover_text(&app.title);
+                                                            );
                                                         let (name_color, title_color) = if info_response.hovered() {
                                                             (self.accent_color, self.accent_color)
                                                         } else {
@@ -2653,37 +3101,60 @@ impl OverbarApp {
                                             ui.add_space(9.0);
                                         }
                                     });
+                                ui.add_space(footer_gap);
+                                let (footer_rect, _) = ui.allocate_exact_size(
+                                    Vec2::new(ui.available_width(), footer_height),
+                                    Sense::hover(),
+                                );
+                                let settings_rect = eframe::egui::Rect::from_center_size(
+                                    eframe::egui::pos2(
+                                        footer_rect.left() + 16.0,
+                                        footer_rect.center().y,
+                                    ),
+                                    Vec2::splat(24.0),
+                                );
+                                let settings_response = ui
+                                    .interact(
+                                        settings_rect,
+                                        ui.id().with("wm-settings"),
+                                        Sense::click(),
+                                    )
+                                    .on_hover_cursor(CursorIcon::PointingHand);
+                                let settings_tint = if settings_response.hovered() {
+                                    self.accent_color
+                                } else {
+                                    TEXT_PRIMARY
+                                };
+                                ui.painter().image(
+                                    self.settings_icon.id(),
+                                    eframe::egui::Rect::from_center_size(
+                                        settings_rect.center(),
+                                        Vec2::splat(18.0),
+                                    ),
+                                    eframe::egui::Rect::from_min_max(
+                                        eframe::egui::Pos2::ZERO,
+                                        eframe::egui::pos2(1.0, 1.0),
+                                    ),
+                                    settings_tint,
+                                );
+                                ui.painter().text(
+                                    eframe::egui::pos2(
+                                        footer_rect.right() - 4.0,
+                                        footer_rect.bottom() - 3.0,
+                                    ),
+                                    eframe::egui::Align2::RIGHT_BOTTOM,
+                                    format!("v{}", env!("CARGO_PKG_VERSION")),
+                                    FontId::monospace(8.0),
+                                    STAT_LABEL,
+                                );
+                                if settings_response.clicked() {
+                                    self.apps_panel_open = false;
+                                    reset_windows_wm_settings_overlay();
+                                    self.wm_settings_closing = false;
+                                    self.wm_settings_transition_started = Instant::now();
+                                    self.wm_settings_open = true;
+                                }
                             });
-                        let settings_rect = eframe::egui::Rect::from_min_size(
-                            eframe::egui::pos2(ui.max_rect().left() + 10.0, ui.max_rect().bottom() - 32.0),
-                            Vec2::splat(24.0),
-                        );
-                        let settings_response = ui.interact(
-                            settings_rect,
-                            ui.id().with("wm-settings"),
-                            Sense::click(),
-                        ).on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Window manager settings");
-                        let settings_tint = if settings_response.hovered() {
-                            self.accent_color
-                        } else {
-                            TEXT_PRIMARY
-                        };
-                        ui.painter().image(
-                            self.settings_icon.id(),
-                            eframe::egui::Rect::from_center_size(settings_rect.center(), Vec2::splat(18.0)),
-                            eframe::egui::Rect::from_min_max(
-                                eframe::egui::Pos2::ZERO,
-                                eframe::egui::pos2(1.0, 1.0),
-                            ),
-                            settings_tint,
-                        );
-                        if settings_response.clicked() {
-                            self.apps_panel_open = false;
-                            reset_windows_wm_settings_overlay();
-                            self.wm_settings_closing = false;
-                            self.wm_settings_transition_started = Instant::now();
-                            self.wm_settings_open = true;
-                        }
                     });
             },
         );
@@ -2776,6 +3247,40 @@ impl OverbarApp {
                         });
                         ui.add_space(10.0);
                         ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                            ui.label(RichText::new("Layout & media").font(FontId::monospace(11.0)).strong().color(self.accent_color));
+                            ui.add_space(5.0);
+                            ui.horizontal(|ui| {
+                                ui.set_width(400.0);
+                                ui.label(RichText::new("Window gap").font(FontId::monospace(9.5)).color(TEXT_PRIMARY));
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if Self::draw_panel_text_button(ui, ui.id().with("window-gap-plus"), "+", 24.0, TEXT_PRIMARY, self.accent_color) {
+                                        self.wm_config.window_gap = (self.wm_config.window_gap + 1).min(64);
+                                        changed = true;
+                                    }
+                                    ui.label(RichText::new(format!("{} px", self.wm_config.window_gap)).font(FontId::monospace(9.5)).color(TEXT_MUTED));
+                                    if Self::draw_panel_text_button(ui, ui.id().with("window-gap-minus"), "−", 24.0, TEXT_PRIMARY, self.accent_color) {
+                                        self.wm_config.window_gap = (self.wm_config.window_gap - 1).max(0);
+                                        changed = true;
+                                    }
+                                });
+                            });
+                            ui.horizontal(|ui| {
+                                ui.set_width(400.0);
+                                ui.label(RichText::new("Media name width").font(FontId::monospace(9.5)).color(TEXT_PRIMARY));
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if Self::draw_panel_text_button(ui, ui.id().with("media-width-plus"), "+", 24.0, TEXT_PRIMARY, self.accent_color) {
+                                        self.wm_config.media_name_width = (self.wm_config.media_name_width + 10.0).min(500.0);
+                                        changed = true;
+                                    }
+                                    ui.label(RichText::new(format!("{:.0} px", self.wm_config.media_name_width)).font(FontId::monospace(9.5)).color(TEXT_MUTED));
+                                    if Self::draw_panel_text_button(ui, ui.id().with("media-width-minus"), "−", 24.0, TEXT_PRIMARY, self.accent_color) {
+                                        self.wm_config.media_name_width = (self.wm_config.media_name_width - 10.0).max(80.0);
+                                        changed = true;
+                                    }
+                                });
+                            });
+                            ui.label(RichText::new("Long media names scroll after reaching the configured width.").font(FontId::monospace(8.5)).color(TEXT_MUTED));
+                            ui.add_space(14.0);
                             ui.label(RichText::new("Keybindings").font(FontId::monospace(11.0)).strong().color(self.accent_color));
                             ui.add_space(5.0);
                             let mut keybinding_names = default_wm_keybindings().into_keys().collect::<Vec<_>>();
@@ -2843,8 +3348,7 @@ impl OverbarApp {
                                     RichText::new(ellipsize_title(&path, 62))
                                         .font(FontId::monospace(8.5))
                                         .color(STAT_LABEL),
-                                )
-                                .on_hover_text(path);
+                                );
                             }
                             ui.add_space(4.0);
                             if self.startup_task_in_progress {
@@ -2880,8 +3384,7 @@ impl OverbarApp {
                                         } else {
                                             USAGE_CRITICAL
                                         }),
-                                )
-                                .on_hover_text(status);
+                                );
                             }
                             ui.add_space(12.0);
                             if Self::draw_panel_text_button(
@@ -2988,7 +3491,7 @@ impl OverbarApp {
         let response = if enabled {
             response.on_hover_cursor(CursorIcon::PointingHand)
         } else {
-            response.on_hover_text("Windows protects this process")
+            Self::with_task_tooltip(response, "Windows protects this process")
         };
         let expansion = ui
             .ctx()
@@ -3022,6 +3525,22 @@ impl OverbarApp {
             ),
         );
         enabled && response.clicked()
+    }
+
+    fn with_task_tooltip(
+        response: eframe::egui::Response,
+        text: impl Into<String>,
+    ) -> eframe::egui::Response {
+        let text = text.into();
+        response.on_hover_ui(move |ui| {
+            // The native tooltip frame is styled once at startup. Keeping the
+            // contents frame-free avoids a second border and doubled padding.
+            ui.label(
+                RichText::new(&text)
+                    .font(FontId::monospace(9.0))
+                    .color(TEXT_PRIMARY),
+            );
+        })
     }
 
     fn draw_panel(&mut self, ctx: &Context, monitor_width: f32) {
@@ -3463,7 +3982,8 @@ impl OverbarApp {
                                                             Vec2::new(232.0, 24.0),
                                                             Sense::hover(),
                                                         );
-                                                    let row_response = row_response.on_hover_text(
+                                                    let row_response = Self::with_task_tooltip(
+                                                        row_response,
                                                         format!("PID {}", task.pid),
                                                     );
                                                     if row_response.hovered() {
@@ -4117,6 +4637,28 @@ fn combinations(n: f64, r: f64) -> Option<f64> {
 
 impl App for OverbarApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        if self.startup_search_warmup_stage == 0 {
+            self.search_active = true;
+            self.search_panel_closing = false;
+            self.search_panel_animation_started = Instant::now();
+            self.search_focus_pending = true;
+            self.search_focus_attempts = 0;
+            self.startup_search_warmup_stage = 1;
+            self.startup_search_warmup_started = Instant::now();
+            ctx.request_repaint();
+        } else if self.startup_search_warmup_stage == 1
+            && self.startup_search_warmup_started.elapsed() >= Duration::from_millis(120)
+        {
+            self.search_active = false;
+            self.search_panel_closing = true;
+            self.search_panel_animation_started = Instant::now();
+            self.search_focus_pending = false;
+            self.search_focus_attempts = 0;
+            set_search_keyboard_focus(false, false);
+            self.startup_search_warmup_stage = 2;
+            ctx.request_repaint();
+        }
+
         while let Ok(result) = self.startup_task_updates.try_recv() {
             self.startup_task_in_progress = false;
             self.startup_task_status = Some(match result {
@@ -4130,17 +4672,31 @@ impl App for OverbarApp {
         // eframe sizes are in DPI-independent points; the monitor width supplied here is too.
         let monitor_size = ctx.input(|input| input.viewport().monitor_size);
         if let Some(monitor_size) = monitor_size {
-            let current_size = ctx.input(|input| input.viewport().inner_rect.map(|rect| rect.size()));
-            if current_size.is_none_or(|size| {
-                (size.x - monitor_size.x).abs() > 0.5
-                    || (size.y - BAR_HEIGHT).abs() > 0.5
+            let requested_size = Vec2::new(monitor_size.x, BAR_HEIGHT);
+            if self.last_bar_monitor_size.is_none_or(|size| {
+                (size.x - requested_size.x).abs() > 0.5
+                    || (size.y - requested_size.y).abs() > 0.5
             }) {
-                ctx.send_viewport_cmd(ViewportCommand::OuterPosition([0.0, 0.0].into()));
-                ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(
-                    monitor_size.x,
-                    BAR_HEIGHT,
-                )));
+                ctx.send_viewport_cmd(ViewportCommand::InnerSize(requested_size));
+                self.last_bar_monitor_size = Some(requested_size);
+                self.last_bar_position_y = None;
             }
+        }
+        let bar_slide_elapsed = self.bar_slide_started.elapsed().as_secs_f32();
+        let bar_slide_progress =
+            ease_out_cubic((bar_slide_elapsed / BAR_SLIDE_SECONDS).clamp(0.0, 1.0));
+        let bar_slide_current =
+            self.bar_slide_from + (self.bar_slide_to - self.bar_slide_from) * bar_slide_progress;
+        let bar_position_y = -BAR_HEIGHT * bar_slide_current;
+        if self
+            .last_bar_position_y
+            .is_none_or(|y| (y - bar_position_y).abs() > 0.5)
+        {
+            ctx.send_viewport_cmd(ViewportCommand::OuterPosition([0.0, bar_position_y].into()));
+            self.last_bar_position_y = Some(bar_position_y);
+        }
+        if bar_slide_progress < 1.0 {
+            ctx.request_repaint();
         }
 
         while let Ok(update) = self.window_manager_updates.try_recv() {
@@ -4157,6 +4713,7 @@ impl App for OverbarApp {
                         .map(|workspace| workspace.name.as_str());
                     if self.search_active && previous_active != next_active {
                         self.search_focus_pending = true;
+                        self.search_focus_attempts = 0;
                     }
                     self.workspaces = workspaces;
                     refresh_windows_bar_blur();
@@ -4184,6 +4741,10 @@ impl App for OverbarApp {
                     self.focused_floating = floating;
                     ctx.request_repaint();
                 }
+                WindowManagerUpdate::ResizeMode(active) => {
+                    self.resize_mode_active = active;
+                    ctx.request_repaint();
+                }
                 WindowManagerUpdate::LayoutChanged => {
                     refresh_windows_bar_blur();
                     ctx.request_repaint();
@@ -4191,6 +4752,20 @@ impl App for OverbarApp {
                 WindowManagerUpdate::ConfigChanged(config) => {
                     self.wm_config = config;
                     save_wm_config(&self.wm_config);
+                }
+                WindowManagerUpdate::BarVisibility(hidden) => {
+                    if self.bar_auto_hidden != hidden {
+                        let elapsed = self.bar_slide_started.elapsed().as_secs_f32();
+                        let progress =
+                            ease_out_cubic((elapsed / BAR_SLIDE_SECONDS).clamp(0.0, 1.0));
+                        let current = self.bar_slide_from
+                            + (self.bar_slide_to - self.bar_slide_from) * progress;
+                        self.bar_slide_from = current;
+                        self.bar_slide_to = if hidden { 1.0 } else { 0.0 };
+                        self.bar_slide_started = Instant::now();
+                        self.bar_auto_hidden = hidden;
+                    }
+                    ctx.request_repaint();
                 }
             }
         }
@@ -4239,6 +4814,32 @@ impl App for OverbarApp {
                 self.volume = audio.volume;
             }
             self.volume_muted = audio.muted;
+        }
+        while let Ok(mut media) = self.media_updates.try_recv() {
+            if let Some(next) = media.as_ref()
+                && self.media.as_ref().map(|current| current.playing) != Some(next.playing)
+            {
+                self.animate_media_icon_to(next.playing);
+            }
+            let raw_position = media.as_ref().map(|state| state.position_seconds);
+            if let (Some(previous), Some(next)) = (self.media.as_ref(), media.as_mut())
+                && previous.playing
+                && next.playing
+                && self
+                    .media_raw_position
+                    .is_some_and(|position| (next.position_seconds - position).abs() < 0.01)
+            {
+                // Some providers publish timeline anchors only once per second.
+                // Preserve interpolation between equal anchors so frequent state
+                // polling cannot make the progress line appear stationary.
+                next.position_seconds = (previous.position_seconds
+                    + self.media_updated_at.elapsed().as_secs_f64())
+                    .min(next.duration_seconds.max(0.0));
+            }
+            self.media = media;
+            self.media_raw_position = raw_position;
+            self.media_updated_at = Instant::now();
+            ctx.request_repaint();
         }
 
         if self.last_metrics_refresh.elapsed() >= Duration::from_secs(1) {
@@ -4344,11 +4945,22 @@ impl App for OverbarApp {
                             )
                         })
                         .inner;
-                    if self.search_focus_pending {
+                    let widget_focused = response.has_focus();
+                    if self.search_focus_pending || !widget_focused {
                         response.request_focus();
-                        self.search_focus_pending = !set_search_keyboard_focus(true, false);
+                        if !widget_focused {
+                            ctx.request_repaint_after(Duration::from_millis(16));
+                        }
+                    }
+                    if self.search_focus_pending {
+                        self.search_focus_attempts = self.search_focus_attempts.saturating_add(1);
+                        let native_focused = set_search_keyboard_focus(true, false);
+                        let fully_focused = native_focused && response.has_focus();
+                        self.search_focus_pending = !fully_focused;
                         if self.search_focus_pending {
                             ctx.request_repaint_after(Duration::from_millis(16));
+                        } else {
+                            self.search_focus_attempts = 0;
                         }
                     }
                     if response.changed() {
@@ -4432,11 +5044,12 @@ impl App for OverbarApp {
             });
 
         // A newly-created or elevated application can enter the topmost band.
-        // Do not compete with the full-screen power overlay for the front of
-        // that band: alternating those two HWNDs causes visible flicker.
-        if !self.power_panel_open && !self.power_panel_closing {
-            ensure_windows_overlay_topmost("Overbar");
-        }
+        // When the full-screen power overlay is visible, temporarily move the
+        // bar out of that band so the scrim can cover it cleanly.
+        set_windows_overlay_topmost(
+            "Overbar",
+            !self.power_panel_open && !self.power_panel_closing,
+        );
 
         let escape_pressed = ctx.input(|input| input.key_pressed(eframe::egui::Key::Escape));
         if self.panel_open
@@ -4463,6 +5076,7 @@ impl App for OverbarApp {
             ctx.request_repaint();
         }
         if self.power_panel_open
+            && self.scheduled_power_action.is_none()
             && (escape_pressed
                 || overlay_dismiss_requested(
                     "Overbar Power Menu",
@@ -4762,6 +5376,125 @@ fn spawn_audio_worker(
     _ctx: Context,
     _running: Arc<AtomicBool>,
 ) -> (Sender<AudioCommand>, Receiver<AudioState>) {
+    let (command_sender, _command_receiver) = mpsc::channel();
+    let (_state_sender, state_receiver) = mpsc::channel();
+    (command_sender, state_receiver)
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_media_worker(
+    ctx: Context,
+    running: Arc<AtomicBool>,
+) -> (Sender<MediaCommand>, Receiver<Option<MediaState>>) {
+    use windows::{
+        Media::Control::{
+            GlobalSystemMediaTransportControlsSessionManager,
+            GlobalSystemMediaTransportControlsSessionPlaybackStatus,
+        },
+        Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize},
+    };
+
+    let (command_sender, command_receiver) = mpsc::channel::<MediaCommand>();
+    let (state_sender, state_receiver) = mpsc::channel::<Option<MediaState>>();
+    let _ = thread::Builder::new()
+        .name("windows-media-session-monitor".into())
+        .spawn(move || unsafe {
+            if RoInitialize(RO_INIT_MULTITHREADED).is_err() {
+                return;
+            }
+            let manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
+                .and_then(|operation| operation.get());
+            let Ok(manager) = manager else {
+                RoUninitialize();
+                return;
+            };
+
+            let mut metadata_source = String::new();
+            let mut metadata_title = String::new();
+            let mut metadata_artist = String::new();
+            let mut metadata_refreshed = Instant::now() - Duration::from_secs(10);
+            let mut was_visible = false;
+
+            while running.load(Ordering::Acquire) {
+                match command_receiver.recv_timeout(Duration::from_millis(75)) {
+                    Ok(MediaCommand::TogglePlayPause) => {
+                        if let Ok(session) = manager.GetCurrentSession()
+                            && let Ok(operation) = session.TryTogglePlayPauseAsync()
+                        {
+                            let _ = operation.get();
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+
+                let state = (|| -> windows::core::Result<Option<MediaState>> {
+                    let session = manager.GetCurrentSession()?;
+                    let playback = session.GetPlaybackInfo()?;
+                    let status = playback.PlaybackStatus()?;
+                    if status != GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing
+                        && status
+                            != GlobalSystemMediaTransportControlsSessionPlaybackStatus::Paused
+                    {
+                        return Ok(None);
+                    }
+
+                    let source = session.SourceAppUserModelId()?.to_string();
+                    if source != metadata_source
+                        || metadata_refreshed.elapsed() >= Duration::from_secs(1)
+                    {
+                        if let Ok(properties) = session
+                            .TryGetMediaPropertiesAsync()
+                            .and_then(|operation| operation.get())
+                        {
+                            metadata_title = properties.Title()?.to_string();
+                            metadata_artist = properties.Artist()?.to_string();
+                            metadata_source = source.clone();
+                            metadata_refreshed = Instant::now();
+                        }
+                    }
+                    if metadata_title.trim().is_empty() {
+                        metadata_title = source
+                            .rsplit(['!', '.'])
+                            .find(|part| !part.trim().is_empty())
+                            .unwrap_or("Media")
+                            .to_owned();
+                    }
+
+                    let timeline = session.GetTimelineProperties()?;
+                    let start = timeline.StartTime()?.Duration as f64 / 10_000_000.0;
+                    let end = timeline.EndTime()?.Duration as f64 / 10_000_000.0;
+                    let position = timeline.Position()?.Duration as f64 / 10_000_000.0;
+                    Ok(Some(MediaState {
+                        title: metadata_title.clone(),
+                        artist: metadata_artist.clone(),
+                        playing: status
+                            == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing,
+                        position_seconds: (position - start).max(0.0),
+                        duration_seconds: (end - start).max(0.0),
+                    }))
+                })()
+                .unwrap_or(None);
+
+                if state.is_some() || was_visible {
+                    was_visible = state.is_some();
+                    if state_sender.send(state).is_err() {
+                        break;
+                    }
+                    ctx.request_repaint();
+                }
+            }
+            RoUninitialize();
+        });
+
+    (command_sender, state_receiver)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn spawn_media_worker(
+    _ctx: Context,
+    _running: Arc<AtomicBool>,
+) -> (Sender<MediaCommand>, Receiver<Option<MediaState>>) {
     let (command_sender, _command_receiver) = mpsc::channel();
     let (_state_sender, state_receiver) = mpsc::channel();
     (command_sender, state_receiver)
@@ -5331,6 +6064,8 @@ fn load_wm_config() -> WmConfig {
     for (name, binding) in default_wm_keybindings() {
         config.keybindings.entry(name).or_insert(binding);
     }
+    config.window_gap = config.window_gap.clamp(0, 64);
+    config.media_name_width = config.media_name_width.clamp(80.0, 500.0);
     config
 }
 
@@ -6321,31 +7056,37 @@ fn spawn_title_worker(ctx: Context, running: Arc<AtomicBool>) -> Receiver<String
             while running.load(Ordering::Acquire) {
                 let hwnd = unsafe { GetForegroundWindow() };
                 if !hwnd.is_invalid() {
+                    let mut class_buffer = [0_u16; 256];
+                    let class_length = unsafe { GetClassNameW(hwnd, &mut class_buffer) }
+                        .max(0) as usize;
+                    let class_name = String::from_utf16_lossy(&class_buffer[..class_length]);
+                    let process_name = window_manager::window_process_name(hwnd)
+                        .unwrap_or_default();
                     let length = unsafe { GetWindowTextLengthW(hwnd) };
-                    if length > 0 {
+                    let title = if length > 0 {
                         let mut buffer = vec![0_u16; length as usize + 1];
                         let copied = unsafe { GetWindowTextW(hwnd, &mut buffer) };
                         if copied > 0 {
-                            let title = String::from_utf16_lossy(&buffer[..copied as usize])
+                            String::from_utf16_lossy(&buffer[..copied as usize])
                                 .trim()
-                                .to_owned();
-                            let mut class_buffer = [0_u16; 256];
-                            let class_length = unsafe { GetClassNameW(hwnd, &mut class_buffer) }
-                                .max(0) as usize;
-                            let class_name = String::from_utf16_lossy(&class_buffer[..class_length]);
-                            let title = if is_shell_surface_title(&title, &class_name) {
-                                "Type here to search...".to_owned()
-                            } else {
-                                title
-                            };
-                            if !title.is_empty() && title != previous {
-                                previous.clone_from(&title);
-                                if sender.send(title).is_err() {
-                                    return;
-                                }
-                                ctx.request_repaint();
-                            }
+                                .to_owned()
+                        } else {
+                            String::new()
                         }
+                    } else {
+                        String::new()
+                    };
+                    let title = if is_shell_surface_title(&title, &class_name, &process_name) {
+                        "Type here to search...".to_owned()
+                    } else {
+                        title
+                    };
+                    if !title.is_empty() && title != previous {
+                        previous.clone_from(&title);
+                        if sender.send(title).is_err() {
+                            return;
+                        }
+                        ctx.request_repaint();
                     }
                 }
                 thread::sleep(Duration::from_millis(40));
@@ -6354,16 +7095,30 @@ fn spawn_title_worker(ctx: Context, running: Arc<AtomicBool>) -> Receiver<String
     receiver
 }
 
-fn is_shell_surface_title(title: &str, class_name: &str) -> bool {
+fn is_shell_surface_title(title: &str, class_name: &str, process_name: &str) -> bool {
     let title = title.trim().to_ascii_lowercase();
+    let class_name = class_name.trim().to_ascii_lowercase();
+    let process_name = process_name
+        .trim()
+        .trim_end_matches(".exe")
+        .to_ascii_lowercase();
     matches!(
-        class_name,
-        "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
-            | "TopLevelWindowForOverflowXamlIsland" | "MultitaskingViewFrame"
+        class_name.as_str(),
+        "progman" | "workerw" | "shell_traywnd" | "shell_secondarytraywnd"
+            | "notifyiconoverflowwindow" | "toplevelwindowforoverflowxamlisland"
+            | "multitaskingviewframe" | "tasklistthumbnailwnd" | "tasklistoverlaywnd"
+            | "xaml_windowedpopupclass" | "foregroundstaging" | "immersivelauncher"
+            | "launchertipwnd" | "tooltips_class32" | "#32768"
+    ) || matches!(
+        process_name.as_str(),
+        "popuphost" | "shellexperiencehost" | "startmenuexperiencehost"
+            | "searchhost" | "searchapp" | "textinputhost" | "widgets"
+            | "lockapp" | "securityhealthsystray"
     ) || matches!(
         title.as_str(),
         "program manager" | "system tray overflow window" | "task switching"
-            | "notification center" | "action center"
+            | "notification center" | "action center" | "jump list" | "jumplist"
+            | "popuphost" | "windows shell experience host"
     )
 }
 
@@ -6849,19 +7604,7 @@ fn shell_icon_image(_path: &Path, _size: usize) -> Option<ColorImage> {
 }
 
 #[cfg(target_os = "windows")]
-static PANEL_OVERLAY_CONFIGURED: AtomicBool = AtomicBool::new(false);
-#[cfg(target_os = "windows")]
-static APPS_PANEL_OVERLAY_CONFIGURED: AtomicBool = AtomicBool::new(false);
-#[cfg(target_os = "windows")]
-static POWER_PANEL_OVERLAY_CONFIGURED: AtomicBool = AtomicBool::new(false);
-#[cfg(target_os = "windows")]
-static WM_SETTINGS_OVERLAY_CONFIGURED: AtomicBool = AtomicBool::new(false);
-#[cfg(target_os = "windows")]
-static SEARCH_PANEL_OVERLAY_CONFIGURED: AtomicBool = AtomicBool::new(false);
-#[cfg(target_os = "windows")]
-static SEARCH_INPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
-#[cfg(target_os = "windows")]
-static SEARCH_ATTACHED_THREAD: AtomicU32 = AtomicU32::new(0);
+pub(crate) static SEARCH_INPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "windows")]
 static SEARCH_PREVIOUS_FOREGROUND: std::sync::atomic::AtomicIsize =
     std::sync::atomic::AtomicIsize::new(0);
@@ -6879,20 +7622,44 @@ fn configure_windows_overlay(cc: &eframe::CreationContext<'_>) {
         return;
     };
     let hwnd = HWND(handle.hwnd.get() as *mut c_void);
-    configure_overlay_hwnd(hwnd, 1);
+    if !configure_overlay_hwnd(hwnd, 1) {
+        record_startup_event("main bar native overlay configuration was incomplete");
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn configure_named_overlay(title: &str, subclass_id: usize) {
+    use windows::{
+        Win32::UI::WindowsAndMessaging::{FindWindowW, GetPropW},
+        core::{PCWSTR, w},
+    };
+
+    let wide_title = title
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let Ok(hwnd) = (unsafe { FindWindowW(None, PCWSTR(wide_title.as_ptr())) }) else {
+        return;
+    };
+    // A window property belongs to the HWND itself and disappears when that HWND
+    // is destroyed. Unlike a process-wide boolean this therefore handles eframe
+    // viewport recreation and numeric handle reuse without GetWindowSubclass,
+    // which is not exported by comctl32 on every supported Windows installation.
+    let configured = unsafe { GetPropW(hwnd, w!("OverbarOverlayConfigured")) };
+    if configured.0 as usize == subclass_id {
+        return;
+    }
+    if !configure_overlay_hwnd(hwnd, subclass_id) {
+        record_startup_event(&format!(
+            "overlay configuration incomplete: title={title:?} hwnd=0x{:x} subclass={subclass_id}",
+            hwnd.0 as usize,
+        ));
+    }
 }
 
 #[cfg(target_os = "windows")]
 fn configure_windows_panel_overlay() {
-    use windows::{Win32::UI::WindowsAndMessaging::FindWindowW, core::w};
-
-    if PANEL_OVERLAY_CONFIGURED.load(Ordering::Acquire) {
-        return;
-    }
-    if let Ok(hwnd) = unsafe { FindWindowW(None, w!("Overbar System Panel")) } {
-        configure_overlay_hwnd(hwnd, 2);
-        PANEL_OVERLAY_CONFIGURED.store(true, Ordering::Release);
-    }
+    configure_named_overlay("Overbar System Panel", 2);
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -6900,15 +7667,7 @@ fn configure_windows_panel_overlay() {}
 
 #[cfg(target_os = "windows")]
 fn configure_windows_apps_overlay() {
-    use windows::{Win32::UI::WindowsAndMessaging::FindWindowW, core::w};
-
-    if APPS_PANEL_OVERLAY_CONFIGURED.load(Ordering::Acquire) {
-        return;
-    }
-    if let Ok(hwnd) = unsafe { FindWindowW(None, w!("Overbar Apps Panel")) } {
-        configure_overlay_hwnd(hwnd, 3);
-        APPS_PANEL_OVERLAY_CONFIGURED.store(true, Ordering::Release);
-    }
+    configure_named_overlay("Overbar Apps Panel", 3);
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -6916,15 +7675,7 @@ fn configure_windows_apps_overlay() {}
 
 #[cfg(target_os = "windows")]
 fn configure_windows_power_overlay() {
-    use windows::{Win32::UI::WindowsAndMessaging::FindWindowW, core::w};
-
-    if POWER_PANEL_OVERLAY_CONFIGURED.load(Ordering::Acquire) {
-        return;
-    }
-    if let Ok(hwnd) = unsafe { FindWindowW(None, w!("Overbar Power Menu")) } {
-        configure_overlay_hwnd(hwnd, 6);
-        POWER_PANEL_OVERLAY_CONFIGURED.store(true, Ordering::Release);
-    }
+    configure_named_overlay("Overbar Power Menu", 6);
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -6932,18 +7683,11 @@ fn configure_windows_power_overlay() {}
 
 #[cfg(target_os = "windows")]
 fn configure_windows_wm_settings_overlay() {
-    use windows::{Win32::UI::WindowsAndMessaging::FindWindowW, core::w};
-    if WM_SETTINGS_OVERLAY_CONFIGURED.load(Ordering::Acquire) { return; }
-    if let Ok(hwnd) = unsafe { FindWindowW(None, w!("Overbar WM Settings")) } {
-        configure_overlay_hwnd(hwnd, 5);
-        WM_SETTINGS_OVERLAY_CONFIGURED.store(true, Ordering::Release);
-    }
+    configure_named_overlay("Overbar WM Settings", 5);
 }
 
 #[cfg(target_os = "windows")]
-fn reset_windows_wm_settings_overlay() {
-    WM_SETTINGS_OVERLAY_CONFIGURED.store(false, Ordering::Release);
-}
+fn reset_windows_wm_settings_overlay() {}
 
 #[cfg(not(target_os = "windows"))]
 fn configure_windows_wm_settings_overlay() {}
@@ -6953,15 +7697,7 @@ fn reset_windows_wm_settings_overlay() {}
 
 #[cfg(target_os = "windows")]
 fn configure_windows_search_overlay() {
-    use windows::{Win32::UI::WindowsAndMessaging::FindWindowW, core::w};
-
-    if SEARCH_PANEL_OVERLAY_CONFIGURED.load(Ordering::Acquire) {
-        return;
-    }
-    if let Ok(hwnd) = unsafe { FindWindowW(None, w!("Overbar Search Panel")) } {
-        configure_overlay_hwnd(hwnd, 4);
-        SEARCH_PANEL_OVERLAY_CONFIGURED.store(true, Ordering::Release);
-    }
+    configure_named_overlay("Overbar Search Panel", 4);
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -6969,52 +7705,20 @@ fn configure_windows_search_overlay() {}
 
 #[cfg(target_os = "windows")]
 fn refresh_windows_bar_blur() {
-    use std::ffi::c_void;
-    use windows::{
-        Win32::{
-            Graphics::Dwm::DwmFlush,
-            System::LibraryLoader::{GetModuleHandleW, GetProcAddress},
-            UI::WindowsAndMessaging::FindWindowW,
-        },
-        core::{PCSTR, w},
-    };
-
-    let Ok(hwnd) = (unsafe { FindWindowW(None, w!("Overbar")) }) else {
-        return;
-    };
-    let policy = AccentPolicy {
-        accent_state: ACCENT_ENABLE_BLUR_BEHIND,
-        accent_flags: 0,
-        gradient_color: 0,
-        animation_id: 0,
-    };
-    let mut data = WindowCompositionAttributeData {
-        attribute: WCA_ACCENT_POLICY,
-        data: &policy as *const _ as *mut c_void,
-        size: size_of_val(&policy),
-    };
-    unsafe {
-        if let Ok(user32) = GetModuleHandleW(w!("user32.dll"))
-            && let Some(address) = GetProcAddress(
-                user32,
-                PCSTR(c"SetWindowCompositionAttribute".as_ptr().cast()),
-            )
-        {
-            let set_attribute: SetWindowCompositionAttributeFn = std::mem::transmute(address);
-            let _ = set_attribute(hwnd, &mut data);
-        }
-        let _ = DwmFlush();
-    }
+    // Blur is persistent HWND state and the compositor updates the pixels behind
+    // it automatically. Reapplying the accent policy plus DwmFlush on every
+    // foreground event caused the search-focus flash and could stall animation.
 }
 
 #[cfg(not(target_os = "windows"))]
 fn refresh_windows_bar_blur() {}
 
 #[cfg(target_os = "windows")]
-fn ensure_windows_overlay_topmost(title: &str) {
+fn set_windows_overlay_topmost(title: &str, topmost: bool) {
     use windows::{
         Win32::UI::WindowsAndMessaging::{
-            FindWindowW, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
+            FindWindowW, GWL_EXSTYLE, GetWindowLongPtrW, HWND_NOTOPMOST, HWND_TOPMOST,
+            SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos, WS_EX_TOPMOST,
         },
         core::PCWSTR,
     };
@@ -7024,10 +7728,15 @@ fn ensure_windows_overlay_topmost(title: &str) {
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
     if let Ok(hwnd) = unsafe { FindWindowW(None, PCWSTR(title.as_ptr())) } {
+        let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
+        let is_topmost = ex_style & WS_EX_TOPMOST.0 != 0;
+        if is_topmost == topmost {
+            return;
+        }
         unsafe {
             let _ = SetWindowPos(
                 hwnd,
-                HWND_TOPMOST,
+                if topmost { HWND_TOPMOST } else { HWND_NOTOPMOST },
                 0,
                 0,
                 0,
@@ -7039,6 +7748,14 @@ fn ensure_windows_overlay_topmost(title: &str) {
 }
 
 #[cfg(not(target_os = "windows"))]
+fn set_windows_overlay_topmost(_title: &str, _topmost: bool) {}
+
+#[cfg(target_os = "windows")]
+fn ensure_windows_overlay_topmost(title: &str) {
+    set_windows_overlay_topmost(title, true);
+}
+
+#[cfg(not(target_os = "windows"))]
 fn ensure_windows_overlay_topmost(_title: &str) {}
 
 #[cfg(target_os = "windows")]
@@ -7046,13 +7763,9 @@ fn set_search_keyboard_focus(active: bool, restore_previous_focus: bool) -> bool
     use windows::{
         Win32::{
             Foundation::HWND,
-            System::Threading::{AttachThreadInput, GetCurrentThreadId},
             UI::{
                 Input::KeyboardAndMouse::{GetFocus, SetActiveWindow, SetFocus},
-                WindowsAndMessaging::{
-                    FindWindowW, GetForegroundWindow, GetWindowThreadProcessId,
-                    SetForegroundWindow,
-                },
+                WindowsAndMessaging::{FindWindowW, GetForegroundWindow, SetForegroundWindow},
             },
         },
         core::w,
@@ -7063,56 +7776,34 @@ fn set_search_keyboard_focus(active: bool, restore_previous_focus: bool) -> bool
     };
     if active {
         let previous = unsafe { GetForegroundWindow() };
-        if previous != hwnd {
+        let starting_session = !SEARCH_INPUT_ACTIVE.swap(true, Ordering::AcqRel);
+        if starting_session && previous != hwnd {
             SEARCH_PREVIOUS_FOREGROUND.store(previous.0 as isize, Ordering::Release);
         }
-        SEARCH_INPUT_ACTIVE.store(true, Ordering::Release);
 
-        // Join the foreground input queue for the whole search session. This lets
-        // the persistent bar's TextEdit receive keyboard input without making the
-        // full-width acrylic HWND the foreground window (which caused the flash).
-        let current_thread = unsafe { GetCurrentThreadId() };
-        let foreground_thread = unsafe { GetWindowThreadProcessId(previous, None) };
-        let attached_thread = SEARCH_ATTACHED_THREAD.load(Ordering::Acquire);
+        // Use real window activation rather than an AttachThreadInput+SetFocus
+        // trick. The trick could silently fail against protected/elevated
+        // foreground apps (e.g. the Settings app's UWP host), and even when it
+        // succeeded, winit never saw a WM_ACTIVATE for this window, so egui's
+        // own "viewport focused" flag stayed false and the text cursor never
+        // blinked. Full activation is safe now: the one-frame non-client
+        // repaint flash this used to cause is independently suppressed by
+        // forcing WM_NCACTIVATE's lParam to -1 in overlay_window_proc.
         unsafe {
-            if attached_thread != 0 && attached_thread != foreground_thread {
-                let _ = AttachThreadInput(current_thread, attached_thread, false);
-                SEARCH_ATTACHED_THREAD.store(0, Ordering::Release);
-            }
-            if foreground_thread != 0
-                && foreground_thread != current_thread
-                && attached_thread != foreground_thread
-                && AttachThreadInput(current_thread, foreground_thread, true).as_bool()
-            {
-                SEARCH_ATTACHED_THREAD.store(foreground_thread, Ordering::Release);
-            }
+            let _ = SetForegroundWindow(hwnd);
             let _ = SetActiveWindow(hwnd);
             let _ = SetFocus(hwnd);
-            if GetFocus() != hwnd || GetForegroundWindow() != hwnd {
-                // Shell-hosted windows such as Settings can retain the foreground
-                // queue after launch. A global hotkey is a user-initiated focus
-                // request, so use the foreground API only as a fallback when the
-                // attached-input path did not actually route keyboard input here.
-                let _ = SetForegroundWindow(hwnd);
-                let _ = SetActiveWindow(hwnd);
-                let _ = SetFocus(hwnd);
-            }
-            GetFocus() == hwnd && GetForegroundWindow() == hwnd
+            GetFocus() == hwnd
         }
     } else {
         SEARCH_INPUT_ACTIVE.store(false, Ordering::Release);
         let previous = SEARCH_PREVIOUS_FOREGROUND.swap(0, Ordering::AcqRel);
-        let attached_thread = SEARCH_ATTACHED_THREAD.swap(0, Ordering::AcqRel);
-        let current_thread = unsafe { GetCurrentThreadId() };
         unsafe {
             if restore_previous_focus && previous != 0 {
                 let previous = HWND(previous as *mut std::ffi::c_void);
                 let _ = SetForegroundWindow(previous);
                 let _ = SetActiveWindow(previous);
                 let _ = SetFocus(previous);
-            }
-            if attached_thread != 0 && attached_thread != current_thread {
-                let _ = AttachThreadInput(current_thread, attached_thread, false);
             }
         }
         true
@@ -7129,14 +7820,14 @@ fn search_keyboard_focus_is_active() -> bool {
     use windows::{
         Win32::UI::{
             Input::KeyboardAndMouse::GetFocus,
-            WindowsAndMessaging::{FindWindowW, GetForegroundWindow},
+            WindowsAndMessaging::FindWindowW,
         },
         core::w,
     };
     let Ok(hwnd) = (unsafe { FindWindowW(None, w!("Overbar")) }) else {
         return false;
     };
-    unsafe { GetFocus() == hwnd && GetForegroundWindow() == hwnd }
+    unsafe { GetFocus() == hwnd }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -7227,20 +7918,24 @@ fn overlay_dismiss_requested(
 }
 
 #[cfg(target_os = "windows")]
-fn configure_overlay_hwnd(hwnd: windows::Win32::Foundation::HWND, subclass_id: usize) {
+fn configure_overlay_hwnd(
+    hwnd: windows::Win32::Foundation::HWND,
+    subclass_id: usize,
+) -> bool {
     use std::ffi::c_void;
     use windows::Win32::{
-        Foundation::BOOL,
+        Foundation::{BOOL, HANDLE},
         Graphics::Dwm::{
-            DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_USE_IMMERSIVE_DARK_MODE,
-            DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DwmSetWindowAttribute,
+            DWM_BB_ENABLE, DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_USE_IMMERSIVE_DARK_MODE,
+            DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWM_BLURBEHIND,
+            DwmEnableBlurBehindWindow, DwmSetWindowAttribute,
         },
-        Graphics::Gdi::{CreateRectRgn, SetWindowRgn},
+        Graphics::Gdi::{CreateRectRgn, DeleteObject, SetWindowRgn},
         System::LibraryLoader::{GetModuleHandleW, GetProcAddress},
         UI::Shell::SetWindowSubclass,
         UI::WindowsAndMessaging::{
             GWL_EXSTYLE, GetClientRect, GetWindowLongPtrW, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-            SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos,
+            SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetPropW, SetWindowLongPtrW, SetWindowPos,
             WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
         },
     };
@@ -7253,19 +7948,29 @@ fn configure_overlay_hwnd(hwnd: windows::Win32::Foundation::HWND, subclass_id: u
         } else {
             (style | WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0) & !WS_EX_APPWINDOW.0
         };
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, overlay_style as isize);
-        let _ = SetWindowPos(
-            hwnd,
-            None,
-            0,
-            0,
-            0,
-            0,
-            SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
-        );
+        if overlay_style != style {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, overlay_style as isize);
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
+            );
+        }
         // Enforce non-activation even if the UI backend asks Windows to focus us,
         // and skip Win32's background erase before OpenGL redraws the transparent frame.
-        let _ = SetWindowSubclass(hwnd, Some(overlay_window_proc), subclass_id, 0);
+        let subclassed = SetWindowSubclass(hwnd, Some(overlay_window_proc), subclass_id, 0)
+            .as_bool();
+        let marked = subclassed
+            && SetPropW(
+                hwnd,
+                w!("OverbarOverlayConfigured"),
+                HANDLE(subclass_id as *mut c_void),
+            )
+            .is_ok();
         remove_window_from_taskbar(hwnd);
 
         let dark_mode = BOOL(1);
@@ -7293,11 +7998,16 @@ fn configure_overlay_hwnd(hwnd: windows::Win32::Foundation::HWND, subclass_id: u
         // A rectangular region prevents Windows 11 from clipping the overlay's bottom
         // corners even when the system backdrop is enabled.
         let mut client_rect = windows::Win32::Foundation::RECT::default();
-        if GetClientRect(hwnd, &mut client_rect).is_ok() {
+        if GetClientRect(hwnd, &mut client_rect).is_ok()
+            && client_rect.right > client_rect.left
+            && client_rect.bottom > client_rect.top
+        {
             let region = CreateRectRgn(0, 0, client_rect.right, client_rect.bottom);
             if !region.is_invalid() {
                 // Windows owns the region after a successful call.
-                let _ = SetWindowRgn(hwnd, region, true);
+                if SetWindowRgn(hwnd, region, true) == 0 {
+                    let _ = DeleteObject(region);
+                }
             }
         }
 
@@ -7314,6 +8024,7 @@ fn configure_overlay_hwnd(hwnd: windows::Win32::Foundation::HWND, subclass_id: u
             data: &policy as *const _ as *mut c_void,
             size: size_of_val(&policy),
         };
+        let mut composition_applied = false;
         if let Ok(user32) = GetModuleHandleW(w!("user32.dll")) {
             if let Some(address) = GetProcAddress(
                 user32,
@@ -7321,9 +8032,26 @@ fn configure_overlay_hwnd(hwnd: windows::Win32::Foundation::HWND, subclass_id: u
             ) {
                 let set_window_composition_attribute: SetWindowCompositionAttributeFn =
                     std::mem::transmute(address);
-                let _ = set_window_composition_attribute(hwnd, &mut data);
+                composition_applied =
+                    set_window_composition_attribute(hwnd, &mut data).as_bool();
             }
         }
+        if !composition_applied {
+            // Supported fallback for systems where the undocumented accent-policy
+            // entry point is unavailable or rejected by the compositor.
+            let fallback = DWM_BLURBEHIND {
+                dwFlags: DWM_BB_ENABLE,
+                fEnable: BOOL(1),
+                ..Default::default()
+            };
+            composition_applied = DwmEnableBlurBehindWindow(hwnd, &fallback).is_ok();
+            record_startup_event(&format!(
+                "accent blur unavailable: hwnd=0x{:x} documented_fallback={composition_applied}",
+                hwnd.0 as usize,
+            ));
+        }
+
+        marked && composition_applied
     }
 }
 
@@ -7381,17 +8109,19 @@ unsafe extern "system" fn overlay_window_proc(
     _reference_data: usize,
 ) -> windows::Win32::Foundation::LRESULT {
     use windows::Win32::{
-        Foundation::{LRESULT, RECT},
-        Graphics::Gdi::{CreateRectRgn, SetWindowRgn},
+        Foundation::{LPARAM, LRESULT, RECT},
+        Graphics::Gdi::{CreateRectRgn, DeleteObject, SetWindowRgn},
         UI::{
             Shell::DefSubclassProc,
             WindowsAndMessaging::{
                 GWL_EXSTYLE, GetClientRect, HTTRANSPARENT, MA_NOACTIVATE, STYLESTRUCT,
-                WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_NCHITTEST, WM_SIZE, WM_STYLECHANGING,
-                WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+                RemovePropW, WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_NCACTIVATE, WM_NCHITTEST,
+                WM_NCDESTROY, WM_SIZE, WM_STYLECHANGING, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
+                WS_EX_TOOLWINDOW,
             },
         },
     };
+    use windows::core::w;
 
     match message {
         WM_NCHITTEST if subclass_id == 4 && !SEARCH_INPUT_ACTIVE.load(Ordering::Acquire) =>
@@ -7405,6 +8135,21 @@ unsafe extern "system" fn overlay_window_proc(
             LRESULT(MA_NOACTIVATE as isize)
         }
         WM_ERASEBKGND => LRESULT(1),
+        WM_NCDESTROY => {
+            let _ = unsafe { RemovePropW(hwnd, w!("OverbarOverlayConfigured")) };
+            unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+        }
+        WM_NCACTIVATE => {
+            // Our search-focus trick (AttachThreadInput + SetFocus) legitimately
+            // activates these overlay windows without going through
+            // SetForegroundWindow, but Windows still sends WM_NCACTIVATE, which by
+            // default repaints the non-client area to reflect the new
+            // active/inactive state. For these borderless/custom-chrome windows
+            // that repaint is the visible one-frame flash. Passing lParam = -1
+            // tells DefWindowProc to skip that repaint while still handling the
+            // message correctly.
+            unsafe { DefSubclassProc(hwnd, message, wparam, LPARAM(-1)) }
+        }
         WM_STYLECHANGING if wparam.0 as i32 == GWL_EXSTYLE.0 && lparam.0 != 0 => {
             let styles = unsafe { &mut *(lparam.0 as *mut STYLESTRUCT) };
             styles.styleNew = (styles.styleNew | WS_EX_TOOLWINDOW.0) & !WS_EX_APPWINDOW.0;
@@ -7417,12 +8162,17 @@ unsafe extern "system" fn overlay_window_proc(
         }
         WM_SIZE => {
             let mut client_rect = RECT::default();
-            if unsafe { GetClientRect(hwnd, &mut client_rect).is_ok() } {
+            if unsafe { GetClientRect(hwnd, &mut client_rect).is_ok() }
+                && client_rect.right > client_rect.left
+                && client_rect.bottom > client_rect.top
+            {
                 let region = unsafe {
                     CreateRectRgn(0, 0, client_rect.right, client_rect.bottom)
                 };
                 if !region.is_invalid() {
-                    let _ = unsafe { SetWindowRgn(hwnd, region, true) };
+                    if unsafe { SetWindowRgn(hwnd, region, true) } == 0 {
+                        let _ = unsafe { DeleteObject(region) };
+                    }
                 }
             }
             unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
@@ -7449,12 +8199,33 @@ mod tests {
 
     #[test]
     fn shell_surfaces_use_the_search_fallback() {
-        assert!(is_shell_surface_title("Program Manager", "Progman"));
+        assert!(is_shell_surface_title("Program Manager", "Progman", "explorer.exe"));
         assert!(is_shell_surface_title(
             "System tray overflow window",
             "TopLevelWindowForOverflowXamlIsland",
+            "explorer.exe",
         ));
-        assert!(!is_shell_surface_title("Project - Visual Studio Code", "Chrome_WidgetWin_1"));
+        assert!(is_shell_surface_title(
+            "",
+            "Windows.UI.Core.CoreWindow",
+            "PopupHost.exe",
+        ));
+        assert!(is_shell_surface_title(
+            "Pinned",
+            "Xaml_WindowedPopupClass",
+            "explorer.exe",
+        ));
+        assert!(is_shell_surface_title("Jump List", "Anything", "explorer.exe"));
+        assert!(!is_shell_surface_title(
+            "Project - Visual Studio Code",
+            "Chrome_WidgetWin_1",
+            "Code.exe",
+        ));
+        assert!(!is_shell_surface_title(
+            "Downloads",
+            "CabinetWClass",
+            "explorer.exe",
+        ));
     }
 
     #[test]

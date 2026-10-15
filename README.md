@@ -25,8 +25,8 @@ A lightweight native Windows topbar and tiling window manager written in Rust.
 | `Alt+I/O` | Decrease / increase height by 2% |
 | `Alt+R` | Enter resize mode; use H/J/K/L or arrows, then Enter/Escape |
 | `Alt+V` | Toggle horizontal / vertical tiling |
-| `Alt+Shift+Space` | Toggle floating for the focused window |
-| `Alt+T` | Toggle tiling for the focused window |
+| `Alt+Shift+Space` | Cycle tiled / floating for the focused window |
+| `Alt+T` | Set tiled: floating windows become tiled, tiled windows are retiled in place |
 | `Alt+F` | Toggle fullscreen |
 | `Alt+M` | Toggle minimized |
 | `Alt+Shift+Q` | Close the focused window |

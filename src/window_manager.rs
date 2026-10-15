@@ -6,8 +6,10 @@
 
 use super::{
     AppEntry, TilingDirection, WindowManagerCommand, WindowManagerUpdate, WmConfig, WorkspaceEntry,
-    WorkspacesState,
+    WorkspacesState, is_shell_surface_title,
 };
+#[cfg(target_os = "windows")]
+use super::SEARCH_INPUT_ACTIVE;
 use eframe::egui::Context;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -23,6 +25,99 @@ use std::{
 
 #[cfg(target_os = "windows")]
 use std::ffi::c_void;
+
+/// Height, in pixels, of the bar's reserved strip at the top of its monitor.
+/// Kept as a single constant since both the workspace-area reservation and
+/// the bar-overlap/fullscreen detection need to agree on it.
+#[cfg(target_os = "windows")]
+const BAR_HEIGHT: i32 = 41;
+
+#[cfg(target_os = "windows")]
+fn spawn_unelevated_explorer() -> Result<(), String> {
+    use windows::{
+        Win32::{
+            Foundation::CloseHandle,
+            System::Threading::{
+                CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+                InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess,
+                PROCESS_CREATE_PROCESS, PROCESS_INFORMATION, STARTUPINFOEXW,
+                UpdateProcThreadAttribute,
+            },
+            UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId},
+        },
+        core::{PCWSTR, PWSTR},
+    };
+    const PROC_THREAD_ATTRIBUTE_PARENT_PROCESS: usize = 0x0002_0000;
+
+    unsafe {
+        let shell = GetShellWindow();
+        if shell.is_invalid() {
+            return Err("no shell window".into());
+        }
+        let mut pid = 0_u32;
+        GetWindowThreadProcessId(shell, Some(&mut pid));
+        if pid == 0 {
+            return Err("no shell process".into());
+        }
+        // A child created with the shell as its parent process inherits the
+        // shell's (non-elevated) token, exactly like a taskbar launch.
+        let parent = OpenProcess(PROCESS_CREATE_PROCESS, false, pid)
+            .map_err(|error| format!("OpenProcess: {error}"))?;
+
+        let mut size = 0_usize;
+        let _ = InitializeProcThreadAttributeList(LPPROC_THREAD_ATTRIBUTE_LIST::default(), 1, 0, &mut size);
+        let mut buffer = vec![0_u8; size];
+        let attributes = LPPROC_THREAD_ATTRIBUTE_LIST(buffer.as_mut_ptr().cast());
+        if let Err(error) = InitializeProcThreadAttributeList(attributes, 1, 0, &mut size) {
+            let _ = CloseHandle(parent);
+            return Err(format!("InitializeProcThreadAttributeList: {error}"));
+        }
+        let updated = UpdateProcThreadAttribute(
+            attributes,
+            0,
+            PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
+            Some((&parent as *const _) as *const std::ffi::c_void),
+            std::mem::size_of_val(&parent),
+            None,
+            None,
+        );
+        if let Err(error) = updated {
+            DeleteProcThreadAttributeList(attributes);
+            let _ = CloseHandle(parent);
+            return Err(format!("UpdateProcThreadAttribute: {error}"));
+        }
+
+        let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
+        let exe = format!("{windir}\\explorer.exe");
+        let application = exe.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let mut command_line = format!("\"{exe}\"")
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>();
+        let mut startup = STARTUPINFOEXW::default();
+        startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+        startup.lpAttributeList = attributes;
+        let mut information = PROCESS_INFORMATION::default();
+        let created = CreateProcessW(
+            PCWSTR(application.as_ptr()),
+            PWSTR(command_line.as_mut_ptr()),
+            None,
+            None,
+            false,
+            EXTENDED_STARTUPINFO_PRESENT,
+            None,
+            PCWSTR::null(),
+            &startup.StartupInfo,
+            &mut information,
+        );
+        DeleteProcThreadAttributeList(attributes);
+        let _ = CloseHandle(parent);
+        created.map_err(|error| format!("CreateProcessW: {error}"))?;
+        let _ = CloseHandle(information.hProcess);
+        let _ = CloseHandle(information.hThread);
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug)]
 struct ManagedWindow {
@@ -40,6 +135,15 @@ struct ManagedWindow {
     workspace: usize,
     floating: bool,
     fullscreen_restore: Option<FullscreenRestore>,
+    /// Set to the window's original workspace while it is being auto-handled
+    /// as a native (OS-level) maximize: moved to its own workspace (or kept in
+    /// place if it already had none) while the bar auto-hides. Cleared when
+    /// the window is restored.
+    maximize_restore: Option<usize>,
+    /// Distinguishes a real Win32 maximize from an app-controlled borderless
+    /// fullscreen window. Frameless Electron windows can match both shapes,
+    /// but their restore button must be governed by `IsZoomed` alone.
+    native_maximized: bool,
 }
 
 #[cfg(target_os = "windows")]
@@ -64,9 +168,6 @@ struct FullscreenRestore {
     rect: (i32, i32, i32, i32),
     style: i32,
 }
-
-#[cfg(target_os = "windows")]
-const TILE_GAP: i32 = 18;
 
 #[cfg(target_os = "windows")]
 #[derive(Clone, Debug)]
@@ -217,7 +318,47 @@ impl LayoutNode {
         }
     }
 
-    fn rects(&self, rect: LayoutRect, output: &mut Vec<(isize, LayoutRect)>) {
+    /// Moves the nearest matching split boundary in the requested screen
+    /// direction. Unlike `resize_for`, the sign is not inverted for a window
+    /// in the second child: Right always moves the divider right and Down
+    /// always moves it down, regardless of which side owns focus.
+    fn move_boundary_for(
+        &mut self,
+        handle: isize,
+        direction: TilingDirection,
+        delta: f32,
+    ) -> bool {
+        let Self::Split {
+            direction: split_direction,
+            ratio,
+            first,
+            second,
+        } = self
+        else {
+            return false;
+        };
+        let in_first = first.contains(handle);
+        let in_second = second.contains(handle);
+        if !in_first && !in_second {
+            return false;
+        }
+        let child_resized = if in_first {
+            first.move_boundary_for(handle, direction, delta)
+        } else {
+            second.move_boundary_for(handle, direction, delta)
+        };
+        if child_resized {
+            return true;
+        }
+        if *split_direction != direction {
+            return false;
+        }
+        let previous = *ratio;
+        *ratio = (*ratio + delta).clamp(0.1, 0.9);
+        (*ratio - previous).abs() > f32::EPSILON
+    }
+
+    fn rects(&self, rect: LayoutRect, gap: i32, output: &mut Vec<(isize, LayoutRect)>) {
         match self {
             Self::Leaf(handle) => output.push((*handle, rect)),
             Self::Split {
@@ -231,16 +372,18 @@ impl LayoutNode {
                         + ((rect.right - rect.left) as f32 * ratio).round() as i32;
                     first.rects(
                         LayoutRect {
-                            right: split - TILE_GAP / 2,
+                            right: split - gap / 2,
                             ..rect
                         },
+                        gap,
                         output,
                     );
                     second.rects(
                         LayoutRect {
-                            left: split + TILE_GAP / 2,
+                            left: split + (gap + 1) / 2,
                             ..rect
                         },
+                        gap,
                         output,
                     );
                 }
@@ -249,16 +392,18 @@ impl LayoutNode {
                         + ((rect.bottom - rect.top) as f32 * ratio).round() as i32;
                     first.rects(
                         LayoutRect {
-                            bottom: split - TILE_GAP / 2,
+                            bottom: split - gap / 2,
                             ..rect
                         },
+                        gap,
                         output,
                     );
                     second.rects(
                         LayoutRect {
-                            top: split + TILE_GAP / 2,
+                            top: split + (gap + 1) / 2,
                             ..rect
                         },
+                        gap,
                         output,
                     );
                 }
@@ -320,10 +465,16 @@ struct Manager {
     last_focused: HashMap<usize, isize>,
     last_foreground_event: Option<(isize, Instant)>,
     pending_workspace_focus: Option<(usize, isize, Instant)>,
+    last_focus_retry: Instant,
+    last_workspace_departure: Option<(usize, Instant)>,
+    workspace_switch_guard: Option<(usize, Instant)>,
+    last_explorer_relaunch: Instant,
     layouts: HashMap<usize, LayoutNode>,
     workspace_monitors: HashMap<usize, isize>,
     insertion_directions: HashMap<isize, TilingDirection>,
     minimum_sizes: HashMap<isize, (i32, i32)>,
+    /// Largest app-enforced outer size seen and consecutive observation count.
+    pending_growth: HashMap<isize, (i32, i32, u8)>,
     dragging: Option<isize>,
     snap_target: Option<SnapTarget>,
     parked_rects: HashMap<isize, LayoutRect>,
@@ -331,8 +482,26 @@ struct Manager {
     resize_mode: bool,
     closing: HashSet<isize>,
     taskbar_hidden: HashSet<isize>,
+    /// Handles parked (hidden off-screen) by the most recent `focus_workspace`
+    /// transition, with the instant each was parked. Windows can emit a
+    /// spurious `EVENT_SYSTEM_FOREGROUND` for a window immediately after it is
+    /// moved off-screen with `SetWindowPos`, even with `SWP_NOACTIVATE` set.
+    /// Without this guard that spurious event reached
+    /// `redirect_hidden_app_activation`, which (for Explorer) misread it as a
+    /// genuine taskbar click and launched an unwanted new `explorer.exe`.
+    recently_parked: HashMap<isize, Instant>,
+    last_local_foreground: Option<(isize, Instant)>,
+    /// Set when a new Explorer window has been spawned to satisfy a hidden-app
+    /// activation, cleared once `refresh()` discovers that window. Without
+    /// this, a parked Explorer HWND that keeps re-reporting itself as the OS
+    /// foreground window (observed to happen repeatedly, seconds apart, with
+    /// no further user click) would otherwise spawn a brand new `explorer.exe`
+    /// every time, since the 750ms cooldown alone doesn't survive gaps that
+    /// long.
+    pending_explorer_relaunch: Option<usize>,
     last_published: Option<WorkspacesState>,
     config: WmConfig,
+    bar_hidden: bool,
 }
 
 #[cfg(target_os = "windows")]
@@ -347,10 +516,15 @@ impl Manager {
             last_focused: HashMap::new(),
             last_foreground_event: None,
             pending_workspace_focus: None,
+            last_focus_retry: Instant::now() - Duration::from_secs(1),
+            last_workspace_departure: None,
+            workspace_switch_guard: None,
+            last_explorer_relaunch: Instant::now() - Duration::from_secs(1),
             layouts: HashMap::new(),
             workspace_monitors: HashMap::new(),
             insertion_directions: HashMap::new(),
             minimum_sizes: HashMap::new(),
+            pending_growth: HashMap::new(),
             dragging: None,
             snap_target: None,
             parked_rects: HashMap::new(),
@@ -358,31 +532,49 @@ impl Manager {
             resize_mode: false,
             closing: HashSet::new(),
             taskbar_hidden: HashSet::new(),
+            recently_parked: HashMap::new(),
+            last_local_foreground: None,
+            pending_explorer_relaunch: None,
             last_published: None,
             config,
+            bar_hidden: false,
         }
     }
 
     fn refresh(&mut self) -> (bool, bool) {
-        use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, IsWindow};
+        use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, IsIconic, IsWindow};
 
         self.closing.retain(|handle| unsafe { IsWindow(hwnd(*handle)) }.as_bool());
         let discovered = enumerate_manageable_windows()
             .into_iter()
-            .filter(|window| !self.closing.contains(&window.handle))
             .collect::<Vec<_>>();
         let discovered_handles = discovered.iter().map(|window| window.handle).collect::<HashSet<_>>();
         // Hidden-to-tray windows keep a valid HWND, but they are no longer a
         // visible managed window and must not keep their workspace alive.
         let removed = self.windows.keys().copied()
-            .filter(|handle| !discovered_handles.contains(handle))
+            .filter(|handle| {
+                !discovered_handles.contains(handle)
+                    && !unsafe { IsIconic(hwnd(*handle)) }.as_bool()
+            })
             .collect::<Vec<_>>();
         for handle in &removed {
-            self.windows.remove(handle);
+            if let Some(window) = self.windows.remove(handle)
+                && window.workspace == self.active_workspace
+            {
+                self.last_workspace_departure = Some((window.workspace, Instant::now()));
+            }
+            self.closing.remove(handle);
+            if self
+                .pending_workspace_focus
+                .is_some_and(|(_, pending, _)| pending == *handle)
+            {
+                self.pending_workspace_focus = None;
+            }
             self.parked_rects.remove(handle);
             self.remove_from_layout(*handle);
             self.insertion_directions.remove(handle);
             self.minimum_sizes.remove(handle);
+            self.pending_growth.remove(handle);
             self.taskbar_hidden.remove(handle);
             self.last_focused.retain(|_, candidate| candidate != handle);
         }
@@ -399,6 +591,15 @@ impl Manager {
                     changed = true;
                 }
             } else {
+                let explorer_spawn_workspace = if window
+                    .process_name
+                    .trim_end_matches(".exe")
+                    .eq_ignore_ascii_case("explorer")
+                {
+                    self.pending_explorer_relaunch.take()
+                } else {
+                    None
+                };
                 window.workspace = self.active_workspace;
                 let handle = window.handle;
                 let persistence_key = window.persistence_key();
@@ -413,7 +614,15 @@ impl Manager {
                 } else {
                     window_min_track_size(handle).unwrap_or((64, 64))
                 });
-                set_managed_window_transitions(handle, true);
+                // Discord owns its custom maximize/restore chrome. Forcing
+                // DWM transitions off on that HWND can leave Electron's
+                // caption state out of sync, so let DWM manage it normally.
+                let disable_transitions = !window
+                    .process_name
+                    .trim_end_matches(".exe")
+                    .to_ascii_lowercase()
+                    .starts_with("discord");
+                set_managed_window_transitions(handle, disable_transitions);
                 self.windows.insert(handle, window);
                 let mut workspace = self.active_workspace;
                 if !floating {
@@ -431,17 +640,84 @@ impl Manager {
                             if let Some(original) = original_layout {
                                 self.layouts.insert(self.active_workspace, original);
                             }
-                            workspace = self.next_available_workspace();
-                            if let Some(window) = self.windows.get_mut(&handle) {
-                                window.workspace = workspace;
+                            // The new window doesn't fit anywhere in the
+                            // existing layout even after trying every
+                            // insertion point. Rather than always banishing
+                            // whichever window happened to be discovered
+                            // last (essentially arbitrary - on initial
+                            // launch, many pre-existing windows are
+                            // enumerated and inserted one after another, so
+                            // "last discovered" has nothing to do with which
+                            // one is actually oversized), relocate whichever
+                            // single window - the new one or an existing
+                            // sibling already in this workspace - has the
+                            // LARGEST minimum footprint, since that is the
+                            // one actually responsible for the overflow.
+                            let area_of = |manager: &Self, candidate: isize| {
+                                manager.minimum_sizes.get(&candidate)
+                                    .map(|(width, height)| (*width as i64) * (*height as i64))
+                                    .unwrap_or(64 * 64)
+                            };
+                            let mut biggest = handle;
+                            let mut biggest_area = area_of(self, handle);
+                            let mut siblings = Vec::new();
+                            if let Some(root) = self.layouts.get(&self.active_workspace) {
+                                root.leaves(&mut siblings);
                             }
-                            self.insert_into_layout(workspace, handle, None, None, true);
+                            for sibling in siblings {
+                                let area = area_of(self, sibling);
+                                if area > biggest_area {
+                                    biggest_area = area;
+                                    biggest = sibling;
+                                }
+                            }
+                            if biggest != handle {
+                                // Move the oversized existing window away,
+                                // then retry inserting the new (comparatively
+                                // smaller) window normally.
+                                self.remove_from_layout(biggest);
+                                let displaced_workspace = self.next_available_workspace();
+                                if let Some(window) = self.windows.get_mut(&biggest) {
+                                    window.workspace = displaced_workspace;
+                                }
+                                self.insert_into_layout(displaced_workspace, biggest, None, None, true);
+                                self.insert_into_layout(self.active_workspace, handle, self.focused, None, true);
+                                if !self.constrain_workspace_to_minimum(self.active_workspace) {
+                                    // Still doesn't fit (e.g. the new window
+                                    // is ALSO oversized on its own) - fall
+                                    // back to moving the new window itself.
+                                    self.remove_from_layout(handle);
+                                    workspace = self.next_available_workspace();
+                                    if let Some(window) = self.windows.get_mut(&handle) {
+                                        window.workspace = workspace;
+                                    }
+                                    self.insert_into_layout(workspace, handle, None, None, true);
+                                }
+                            } else {
+                                workspace = self.next_available_workspace();
+                                if let Some(window) = self.windows.get_mut(&handle) {
+                                    window.workspace = workspace;
+                                }
+                                self.insert_into_layout(workspace, handle, None, None, true);
+                            }
                         }
                     }
                 } else if should_center {
                     self.center_floating_window(handle);
                 }
-                newest_window = Some((handle, workspace));
+                let relocate_to = explorer_spawn_workspace.filter(|target| {
+                    *target != self.active_workspace && workspace == self.active_workspace
+                });
+                if let Some(target) = relocate_to {
+                    // The user already left the workspace that requested this
+                    // Explorer window; keep it there, parked, instead of
+                    // dropping it onto whatever workspace is active now.
+                    self.relocate_window_to_workspace(handle, target);
+                    self.park_window(handle);
+                    self.sync_taskbar_visibility();
+                } else {
+                    newest_window = Some((handle, workspace));
+                }
                 changed = true;
                 layout_changed = true;
             }
@@ -456,8 +732,6 @@ impl Manager {
                 self.last_focused.insert(workspace, handle);
                 self.pending_workspace_focus = Some((workspace, handle, Instant::now()));
             }
-        } else if !removed.is_empty() {
-            self.focus_active_replacement();
         }
 
         let foreground = unsafe { GetForegroundWindow() };
@@ -465,33 +739,70 @@ impl Manager {
             .filter(|(_, received)| received.elapsed() < Duration::from_millis(100))
             .map(|(handle, _)| handle)
             .or_else(|| (!foreground.is_invalid()).then_some(foreground.0 as isize));
-        let mut focused = foreground_handle
-            .filter(|handle| self.windows.contains_key(handle));
+        // While launcher input is active its HWND is intentionally foreground but
+        // is not a managed application. Preserve the last application focus and
+        // border instead of interpreting that transient foreground state as "none".
+        let mut focused = if SEARCH_INPUT_ACTIVE.load(Ordering::Acquire) {
+            self.focused.filter(|handle| self.windows.contains_key(handle))
+        } else {
+            foreground_handle.filter(|handle| self.windows.contains_key(handle))
+        };
         if let Some(handle) = focused
             && self.windows.get(&handle).is_some_and(|window| window.workspace != self.active_workspace)
         {
-            // A taskbar/Alt-Tab activation must not pull an inactive workspace
-            // window back onto the current desktop.
-            self.park_window(handle);
-            focused = self.last_focused.get(&self.active_workspace).copied()
-                .filter(|candidate| self.windows.contains_key(candidate));
-            if let Some(active) = focused {
-                focus_native_window(active);
-                self.pending_workspace_focus = Some((
-                    self.active_workspace,
-                    active,
-                    Instant::now(),
-                ));
+            // The foreground event for this window may still be queued. Taking
+            // focus back here would make it look stale by the time it is
+            // handled, so a tray/app-initiated activation could never switch
+            // workspaces. Leave it to `apply_foreground_event` to decide.
+            use windows::Win32::UI::WindowsAndMessaging::EVENT_SYSTEM_FOREGROUND;
+            let event_pending = WINDOW_EVENTS
+                .get_or_init(Default::default)
+                .lock()
+                .map(|events| {
+                    events.iter().any(|(event, queued)| {
+                        *event == EVENT_SYSTEM_FOREGROUND && *queued == handle
+                    })
+                })
+                .unwrap_or(false);
+            if event_pending {
+                focused = None;
+            } else {
+                // A taskbar/Alt-Tab activation must not pull an inactive workspace
+                // window back onto the current desktop.
+                self.park_window(handle);
+                focused = self.last_focused.get(&self.active_workspace).copied()
+                    .filter(|candidate| self.windows.contains_key(candidate));
+                if let Some(active) = focused {
+                    focus_native_window(active);
+                    self.pending_workspace_focus = Some((
+                        self.active_workspace,
+                        active,
+                        Instant::now(),
+                    ));
+                }
             }
+        }
+        // Keep the "last local foreground" fresh while a local window actually
+        // holds focus, so a minimize fallback is recognised even if the window
+        // had been focused for longer than the fallback grace period.
+        if let Some(handle) = focused
+            && self.windows.get(&handle).is_some_and(|window| window.workspace == self.active_workspace)
+        {
+            self.last_local_foreground = Some((handle, Instant::now()));
         }
         if self.focused != focused {
             self.focused = focused;
             changed = true;
             if let Some(handle) = focused {
-                let direction = *self
+                let workspace = self
+                    .windows
+                    .get(&handle)
+                    .map_or(self.active_workspace, |window| window.workspace);
+                let direction = self
                     .insertion_directions
-                    .entry(handle)
-                    .or_insert(TilingDirection::Horizontal);
+                    .get(&handle)
+                    .copied()
+                    .unwrap_or_else(|| self.automatic_direction(workspace, handle));
                 self.direction = direction;
             }
         }
@@ -575,20 +886,53 @@ impl Manager {
         self.remove_from_layout(handle);
         let monitor = unsafe { MonitorFromWindow(hwnd(handle), MONITOR_DEFAULTTONEAREST) }.0 as isize;
         self.workspace_monitors.entry(workspace).or_insert(monitor);
-        if let Some(root) = self.layouts.get_mut(&workspace) {
+        if self.layouts.contains_key(&workspace) {
             let mut leaves = Vec::new();
-            root.leaves(&mut leaves);
-            let target = preferred_target.filter(|candidate| root.contains(*candidate))
-                .or_else(|| self.last_focused.get(&workspace).copied().filter(|candidate| root.contains(*candidate)))
+            if let Some(root) = self.layouts.get(&workspace) {
+                root.leaves(&mut leaves);
+            }
+            let target = preferred_target.filter(|candidate| {
+                self.layouts
+                    .get(&workspace)
+                    .is_some_and(|root| root.contains(*candidate))
+            })
+                .or_else(|| self.last_focused.get(&workspace).copied().filter(|candidate| {
+                    self.layouts
+                        .get(&workspace)
+                        .is_some_and(|root| root.contains(*candidate))
+                }))
                 .or_else(|| leaves.last().copied());
             if let Some(target) = target {
                 let direction = forced_direction
                     .or_else(|| self.insertion_directions.get(&target).copied())
-                    .unwrap_or(self.direction);
-                let _ = root.insert_beside(target, handle, direction, after);
+                    .unwrap_or_else(|| self.automatic_direction(workspace, target));
+                if let Some(root) = self.layouts.get_mut(&workspace) {
+                    let _ = root.insert_beside(target, handle, direction, after);
+                }
             }
         } else {
             self.layouts.insert(workspace, LayoutNode::Leaf(handle));
+        }
+    }
+
+    fn automatic_direction(&self, workspace: usize, target: isize) -> TilingDirection {
+        let Some((_, rect)) = self
+            .layout_rects(workspace)
+            .into_iter()
+            .find(|(handle, _)| *handle == target)
+        else {
+            return TilingDirection::Horizontal;
+        };
+        let width = (rect.right - rect.left).max(1) as f32;
+        let height = (rect.bottom - rect.top).max(1) as f32;
+        // Prefer a new column until a tile becomes noticeably taller than it
+        // is wide. This produces useful two/three-column layouts on widescreen
+        // monitors, then starts rows within those columns instead of building
+        // a long vertical stack.
+        if width >= height * 0.85 {
+            TilingDirection::Horizontal
+        } else {
+            TilingDirection::Vertical
         }
     }
 
@@ -605,6 +949,7 @@ impl Manager {
 
         self.recent_workspace = self.active_workspace;
         self.active_workspace = workspace;
+        self.workspace_switch_guard = Some((workspace, Instant::now()));
         // Park inactive workspace windows off-screen rather than hiding or
         // cloaking them. Hide/cloak makes Chromium windows look as if they were
         // destroyed and recreated; parking preserves their compositor surface.
@@ -632,6 +977,10 @@ impl Manager {
             focus_native_window(handle);
             self.focused = Some(handle);
             self.last_focused.insert(workspace, handle);
+            // Remember it as the local foreground so that minimizing it right
+            // away (taskbar click) is recognised and its z-order fallback onto
+            // another workspace's parked window is not mistaken for a switch.
+            self.last_local_foreground = Some((handle, Instant::now()));
             // Some applications do not accept foreground activation until their
             // compositor surface has returned from its parked position. Retry for
             // a short bounded interval instead of losing the workspace's focus.
@@ -672,8 +1021,12 @@ impl Manager {
 
     fn enforce_pending_workspace_focus(&mut self) {
         use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        if SEARCH_INPUT_ACTIVE.load(Ordering::Acquire) {
+            self.pending_workspace_focus = None;
+            return;
+        }
         let Some((workspace, handle, started)) = self.pending_workspace_focus else { return; };
-        if started.elapsed() > Duration::from_millis(1_000)
+        if started.elapsed() > Duration::from_millis(500)
             || workspace != self.active_workspace
             || !self.windows.get(&handle).is_some_and(|window| window.workspace == workspace)
         {
@@ -686,6 +1039,23 @@ impl Manager {
             self.focused = Some(handle);
             return;
         }
+        // If the target got minimized after the switch (the user clicked its
+        // taskbar icon), retrying focus would restore it and undo that.
+        if started.elapsed() > Duration::from_millis(200)
+            && unsafe { windows::Win32::UI::WindowsAndMessaging::IsIconic(hwnd(handle)) }.as_bool()
+        {
+            self.pending_workspace_focus = None;
+            return;
+        }
+        // SetForegroundWindow/AttachThreadInput is intentionally invasive.
+        // Running it every 8 ms made applications repeatedly reactivate and
+        // repaint when Windows rejected focus, which looked like the whole
+        // layout was flashing. Workspace switches still get bounded retries,
+        // but never more often than eight times per second.
+        if self.last_focus_retry.elapsed() < Duration::from_millis(125) {
+            return;
+        }
+        self.last_focus_retry = Instant::now();
         focus_native_window(handle);
         self.focused = Some(handle);
         self.last_focused.insert(workspace, handle);
@@ -720,6 +1090,30 @@ impl Manager {
         let Some(handle) = self.focused else {
             return false;
         };
+        // A window the user native-maximized (or that went borderless
+        // fullscreen) is still conceptually "tiled" underneath - Alt+T on it
+        // should only restore that back to tiled, exactly like clicking the
+        // window's own restore button, instead of also kicking it into
+        // floating mode (which left it in an inconsistent state: floating
+        // but still tagged `maximize_restore`, so it was permanently skipped
+        // by `sync_native_maximize`'s candidate filter and could never be
+        // untangled again).
+        if self.windows.get(&handle).is_some_and(|window| window.maximize_restore.is_some()) {
+            let original = self.windows.get_mut(&handle).and_then(|window| {
+                window.native_maximized = false;
+                window.maximize_restore.take()
+            });
+            let Some(original) = original else { return false; };
+            let current_workspace = self.windows.get(&handle).map(|window| window.workspace);
+            if current_workspace != Some(original) {
+                self.relocate_window_to_workspace(handle, original);
+                self.focus_workspace(original);
+            } else if !self.paused {
+                self.tile_active_workspace();
+            }
+            WINDOW_EVENT_DIRTY.store(true, Ordering::Release);
+            return true;
+        }
         let Some(window) = self.windows.get_mut(&handle) else {
             return false;
         };
@@ -755,6 +1149,28 @@ impl Manager {
         true
     }
 
+    // Unlike `toggle_floating` (which cycles tiled<->floating), this only
+    // ever moves the focused window *towards* tiled: a floating window (or
+    // one that's native-maximized/fullscreen) gets tiled/restored, and a
+    // window that's already tiled just gets retiled in place instead of
+    // being left untouched or flipped to floating.
+    fn set_tiled(&mut self) -> bool {
+        let Some(handle) = self.focused else {
+            return false;
+        };
+        let already_tiled = self.windows.get(&handle).is_some_and(|window| {
+            window.maximize_restore.is_none() && !window.floating
+        });
+        if !already_tiled {
+            return self.toggle_floating();
+        }
+        if !self.paused {
+            self.tile_active_workspace();
+        }
+        WINDOW_EVENT_DIRTY.store(true, Ordering::Release);
+        true
+    }
+
     fn center_focused_floating(&mut self) -> bool {
         let Some(handle) = self.focused else { return false; };
         let Some(key) = self.windows.get(&handle).map(ManagedWindow::persistence_key) else {
@@ -782,6 +1198,7 @@ impl Manager {
                 window.workspace == self.active_workspace
                     && window.floating
                     && window.fullscreen_restore.is_none()
+                    && window.maximize_restore.is_none()
             });
         if !valid { return false; }
         if unsafe { IsIconic(hwnd(handle)) }.as_bool() {
@@ -806,7 +1223,7 @@ impl Manager {
             bottom: info.rcWork.bottom,
         };
         if info.dwFlags != 0 {
-            area.top = area.top.max(info.rcMonitor.top + 41);
+            area.top = area.top.max(info.rcMonitor.top + BAR_HEIGHT);
         }
         let width = (window_rect.right - window_rect.left).max(64);
         let height = (window_rect.bottom - window_rect.top).max(64);
@@ -843,14 +1260,34 @@ impl Manager {
                 LayoutRect { left: 0, top: 0, right: 800, bottom: 600 }
             }
         });
+        let target_width = (rect.right - rect.left).max(64);
+        let target_height = (rect.bottom - rect.top).max(64);
+        // `enforce_workspace_visibility` calls this every ~75ms for every
+        // inactive-workspace window, not just once per workspace switch.
+        // Skip the redundant SetWindowPos (and, crucially, skip refreshing
+        // `recently_parked`) when the window is already sitting at the
+        // parked position - otherwise `recently_parked`'s timestamp would
+        // never actually expire while a window stays in an inactive
+        // workspace, perpetually re-arming `apply_foreground_event`'s
+        // spurious-activation suppression/redirect logic for a window that
+        // hasn't transitioned in a long time. Still re-applies if an app
+        // manages to move itself back on-screen while parked.
+        let mut current = RECT::default();
+        let already_parked = unsafe { GetWindowRect(hwnd(handle), &mut current) }.is_ok()
+            && (current.left - (-32_000)).abs() <= 4
+            && (current.top - (-32_000)).abs() <= 4;
+        if already_parked {
+            return;
+        }
+        self.recently_parked.insert(handle, Instant::now());
         unsafe {
             let _ = SetWindowPos(
                 hwnd(handle),
                 None,
                 -32_000,
                 -32_000,
-                (rect.right - rect.left).max(64),
-                (rect.bottom - rect.top).max(64),
+                target_width,
+                target_height,
                 SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING | SWP_NOZORDER,
             );
         }
@@ -997,6 +1434,213 @@ impl Manager {
         }
     }
 
+    /// Detect windows that have gone fullscreen - either a native OS maximize
+    /// (double-clicked titlebar, Win+Up, maximize button, detected via
+    /// `IsZoomed`) or an app-driven borderless fullscreen such as F11 in a
+    /// browser (detected by the window's rect covering the entire monitor,
+    /// including the area under the taskbar) - or restored, and react: a
+    /// freshly fullscreened window is moved to an empty workspace (if it
+    /// would otherwise share its workspace with other windows) while the bar
+    /// auto-hides; restoring it moves it back to its original workspace and
+    /// switches back there. Only genuinely fullscreen windows trigger the
+    /// workspace relocation - an ordinary window the user merely dragged over
+    /// the bar's strip does not, it only hides the bar (see
+    /// `any_window_over_bar_strip`).
+    fn sync_native_maximize(&mut self, updates: &Sender<WindowManagerUpdate>) {
+        use windows::Win32::{
+            Foundation::RECT,
+            Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow},
+            UI::WindowsAndMessaging::{GWL_STYLE, GetWindowLongW, GetWindowRect, IsZoomed, WS_CAPTION},
+        };
+
+        const COVER_TOLERANCE: i32 = 2;
+        fn covers_monitor(handle: isize) -> bool {
+            // Only treat "window rect covers the whole monitor" as fullscreen
+            // for borderless windows (no title bar / caption) - this is how
+            // apps implement F11-style fullscreen (same style bits our own
+            // `toggle_fullscreen` strips). Ordinary windows that keep their
+            // normal chrome (Discord, FL Studio, ...) rely solely on
+            // `IsZoomed` below; without this guard, a brief resize-animation
+            // frame that happens to land near-fullscreen could misfire as
+            // "became fullscreen", causing spurious workspace relocation.
+            if unsafe { GetWindowLongW(hwnd(handle), GWL_STYLE) } as u32 & WS_CAPTION.0 != 0 {
+                return false;
+            }
+            let mut rect = RECT::default();
+            if unsafe { GetWindowRect(hwnd(handle), &mut rect) }.is_err() {
+                return false;
+            }
+            let monitor = unsafe { MonitorFromWindow(hwnd(handle), MONITOR_DEFAULTTONEAREST) };
+            let mut info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+                return false;
+            }
+            (rect.left - info.rcMonitor.left).abs() <= COVER_TOLERANCE
+                && (rect.top - info.rcMonitor.top).abs() <= COVER_TOLERANCE
+                && (rect.right - info.rcMonitor.right).abs() <= COVER_TOLERANCE
+                && (rect.bottom - info.rcMonitor.bottom).abs() <= COVER_TOLERANCE
+        }
+
+        let candidates = self
+            .windows
+            .values()
+            .filter(|window| !window.floating && window.owner.is_none() && window.fullscreen_restore.is_none())
+            .map(|window| (
+                window.handle,
+                window.workspace,
+                window.maximize_restore,
+                window.native_maximized,
+            ))
+            .collect::<Vec<_>>();
+
+        let mut became_fullscreen = Vec::new();
+        let mut restored = Vec::new();
+        for (handle, workspace, restore, was_native) in candidates {
+            let is_zoomed = unsafe { IsZoomed(hwnd(handle)) }.as_bool();
+            let is_fullscreen = if restore.is_some() && was_native {
+                // Discord and other frameless Electron apps may still cover
+                // the monitor for an animation frame after native restore.
+                // Their Win32 zoom state is authoritative and changes first.
+                is_zoomed
+            } else {
+                is_zoomed || covers_monitor(handle)
+            };
+            match (is_fullscreen, restore) {
+                (true, None) => became_fullscreen.push((handle, workspace, is_zoomed)),
+                (false, Some(original)) => restored.push((handle, original)),
+                _ => {}
+            }
+        }
+
+        for (handle, workspace, native) in became_fullscreen {
+            let has_siblings = self
+                .windows
+                .values()
+                .any(|other| other.handle != handle && other.workspace == workspace);
+            let discord = self.windows.get(&handle).is_some_and(|window| {
+                window
+                    .process_name
+                    .trim_end_matches(".exe")
+                    .to_ascii_lowercase()
+                    .starts_with("discord")
+            });
+            // Keep Discord on its current workspace while maximized. Moving
+            // its Electron HWND through Overbar's cloak/workspace lifecycle
+            // can prevent the custom caption button from completing restore.
+            let target = if has_siblings && !discord {
+                self.next_available_workspace()
+            } else {
+                workspace
+            };
+            if let Some(window) = self.windows.get_mut(&handle) {
+                window.maximize_restore = Some(workspace);
+                window.native_maximized = native;
+            }
+            if target != workspace {
+                self.relocate_window_to_workspace(handle, target);
+                self.focus_workspace(target);
+            }
+            // When solo (no siblings), there is nothing to retile: the
+            // window already occupies the whole workspace. Retiling it here
+            // would immediately shrink it back down to `workspace_area()`
+            // (which excludes the bar strip / monitor edges it just grew
+            // into), making it look like it instantly un-fullscreened
+            // itself. That false "shrink" then satisfied the restore-
+            // detection on the very next poll, silently clearing
+            // `maximize_restore` before the user ever touched the window's
+            // own restore button - this was the root cause of Discord's
+            // (and any other borderless/custom-chrome app's) restore button
+            // appearing to do nothing: our own code had already cleared the
+            // tracked maximize state moments after it was set.
+        }
+        for (handle, original) in restored {
+            if let Some(window) = self.windows.get_mut(&handle) {
+                window.maximize_restore = None;
+                window.native_maximized = false;
+            }
+            let current_workspace = self.windows.get(&handle).map(|window| window.workspace);
+            if current_workspace != Some(original) {
+                self.relocate_window_to_workspace(handle, original);
+                self.focus_workspace(original);
+            } else if !self.paused {
+                self.tile_active_workspace();
+            }
+        }
+
+        // Do not resize natively maximized windows here. Electron and other
+        // custom-chrome applications keep their own maximize bookkeeping;
+        // forcing even a near-identical rectangle with SetWindowPos can make
+        // their restore button issue another maximize instead. Windows owns
+        // the native maximized geometry, while the bar independently hides
+        // whenever that geometry overlaps its strip.
+
+        // Bar auto-hide is broader than the fullscreen/maximize handling
+        // above: hide it whenever ANY visible window on the active workspace
+        // intrudes into its reserved strip (native maximize, borderless
+        // fullscreen, or simply a window dragged up over the bar), without
+        // requiring a workspace switch.
+        let bar_hidden = self.any_window_over_bar_strip();
+        if bar_hidden != self.bar_hidden {
+            self.bar_hidden = bar_hidden;
+            let _ = updates.send(WindowManagerUpdate::BarVisibility(bar_hidden));
+        }
+    }
+
+    /// True if any visible, non-minimized window on the active workspace
+    /// overlaps the bar's reserved strip at the top of its (primary) monitor.
+    fn any_window_over_bar_strip(&self) -> bool {
+        use windows::Win32::{
+            Foundation::{POINT, RECT},
+            Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint},
+            UI::WindowsAndMessaging::{GetWindowRect, IsIconic},
+        };
+        let monitor = unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) };
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+            return false;
+        }
+        let strip_left = info.rcMonitor.left;
+        let strip_right = info.rcMonitor.right;
+        let strip_top = info.rcMonitor.top;
+        let strip_bottom = info.rcMonitor.top + BAR_HEIGHT;
+
+        self.windows.values().filter(|window| window.workspace == self.active_workspace).any(|window| {
+            if unsafe { IsIconic(hwnd(window.handle)) }.as_bool() {
+                return false;
+            }
+            let mut rect = RECT::default();
+            if unsafe { GetWindowRect(hwnd(window.handle), &mut rect) }.is_err() {
+                return false;
+            }
+            rect.left < strip_right && rect.right > strip_left && rect.top < strip_bottom && rect.bottom > strip_top
+        })
+    }
+
+
+    fn relocate_window_to_workspace(&mut self, handle: isize, new_workspace: usize) {
+        let Some(window) = self.windows.get_mut(&handle) else { return };
+        let old_workspace = window.workspace;
+        if old_workspace == new_workspace {
+            return;
+        }
+        window.workspace = new_workspace;
+        self.remove_from_layout(handle);
+        self.insert_into_layout(new_workspace, handle, None, None, true);
+        if self.last_focused.get(&old_workspace) == Some(&handle) {
+            self.last_focused.remove(&old_workspace);
+        }
+        self.last_focused.insert(new_workspace, handle);
+        if !self.paused {
+            self.tile_workspace(old_workspace);
+        }
+    }
+
     fn toggle_minimized(&mut self) {
         use windows::Win32::UI::WindowsAndMessaging::{
             IsIconic, SW_MINIMIZE, SW_RESTORE, ShowWindowAsync,
@@ -1021,14 +1665,23 @@ impl Manager {
     }
 
     fn forget_window(&mut self, handle: isize) -> bool {
-        if self.windows.remove(&handle).is_none() {
-            return false;
+        let Some(window) = self.windows.remove(&handle) else { return false; };
+        if window.workspace == self.active_workspace {
+            self.last_workspace_departure = Some((window.workspace, Instant::now()));
         }
         self.remove_from_layout(handle);
         self.parked_rects.remove(&handle);
         self.insertion_directions.remove(&handle);
         self.minimum_sizes.remove(&handle);
+        self.pending_growth.remove(&handle);
         self.taskbar_hidden.remove(&handle);
+        self.closing.remove(&handle);
+        if self
+            .pending_workspace_focus
+            .is_some_and(|(_, pending, _)| pending == handle)
+        {
+            self.pending_workspace_focus = None;
+        }
         self.last_focused.retain(|_, candidate| *candidate != handle);
         if self.focused == Some(handle) {
             self.focused = None;
@@ -1041,17 +1694,13 @@ impl Manager {
             Foundation::{LPARAM, WPARAM},
             UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE},
         };
-        if !self.forget_window(handle) {
+        if !self.windows.contains_key(&handle) || !self.closing.insert(handle) {
             return;
         }
-        self.closing.insert(handle);
-        unsafe {
-            let _ = PostMessageW(hwnd(handle), WM_CLOSE, WPARAM(0), LPARAM(0));
+        self.note_window_departure(handle);
+        if unsafe { PostMessageW(hwnd(handle), WM_CLOSE, WPARAM(0), LPARAM(0)) }.is_err() {
+            self.closing.remove(&handle);
         }
-        if !self.paused {
-            self.tile_active_workspace();
-        }
-        self.focus_active_replacement();
     }
 
     fn focus_window(&mut self, handle: isize, workspace: usize) {
@@ -1065,7 +1714,30 @@ impl Manager {
     }
 
     fn focus_active_replacement(&mut self) {
-        let preferred = self.last_focused.get(&self.active_workspace).copied()
+        use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+
+        let native_foreground = unsafe { GetForegroundWindow() };
+        let native_foreground = (!native_foreground.is_invalid())
+            .then_some(native_foreground.0 as isize)
+            .filter(|handle| {
+                self.windows.get(handle).is_some_and(|window| {
+                    window.workspace == self.active_workspace
+                        && !self.closing.contains(handle)
+                })
+            });
+        let recent_foreground = self
+            .last_foreground_event
+            .filter(|(_, received)| received.elapsed() < Duration::from_millis(150))
+            .map(|(handle, _)| handle)
+            .filter(|handle| {
+                self.windows.get(handle).is_some_and(|window| {
+                    window.workspace == self.active_workspace
+                        && !self.closing.contains(handle)
+                })
+            });
+        let preferred = native_foreground
+            .or(recent_foreground)
+            .or_else(|| self.last_focused.get(&self.active_workspace).copied())
             .filter(|handle| self.windows.get(handle).is_some_and(|window| {
                 window.workspace == self.active_workspace && !self.closing.contains(handle)
             }));
@@ -1075,14 +1747,19 @@ impl Manager {
             leaves.into_iter().rev().find(|handle| self.windows.contains_key(handle))
         });
         if let Some(handle) = target {
-            focus_native_window(handle);
+            // Closing an app normally causes Windows to reactivate the app
+            // that was focused before it. Honor that native choice instead
+            // of activating an arbitrary BSP leaf and starting a foreground
+            // ping-pong between the OS and the WM.
+            if native_foreground != Some(handle) {
+                focus_native_window(handle);
+            }
             self.focused = Some(handle);
             self.last_focused.insert(self.active_workspace, handle);
-            self.pending_workspace_focus = Some((
-                self.active_workspace,
-                handle,
-                Instant::now(),
-            ));
+            // The surviving window is already visible and stable after the
+            // atomic close reflow. One activation attempt is enough here;
+            // retry loops are reserved for workspace unpark operations.
+            self.pending_workspace_focus = None;
             self.apply_borders();
         } else {
             use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, SetForegroundWindow};
@@ -1110,9 +1787,9 @@ impl Manager {
         };
         let Some(root) = self.layouts.get_mut(&self.active_workspace) else { return; };
         let changed_x = width_delta.abs() > f32::EPSILON
-            && root.resize_for(handle, TilingDirection::Horizontal, width_delta);
+            && root.move_boundary_for(handle, TilingDirection::Horizontal, width_delta);
         let changed_y = height_delta.abs() > f32::EPSILON
-            && root.resize_for(handle, TilingDirection::Vertical, height_delta);
+            && root.move_boundary_for(handle, TilingDirection::Vertical, height_delta);
         if (changed_x || changed_y) && !self.paused {
             self.tile_active_workspace();
         }
@@ -1235,7 +1912,7 @@ impl Manager {
     fn constrain_layout_to_minimum(&self, root: &mut LayoutNode, area: LayoutRect) -> bool {
         for _ in 0..16 {
             let mut rects = Vec::new();
-            root.rects(area, &mut rects);
+            root.rects(area, self.config.window_gap, &mut rects);
             let violation = rects.into_iter().find_map(|(handle, rect)| {
                 let (minimum_width, minimum_height) = self.minimum_sizes
                     .get(&handle).copied().unwrap_or((64, 64));
@@ -1392,95 +2069,192 @@ impl Manager {
         }
         let mut area = monitor_info.rcWork;
         if monitor_info.dwFlags != 0 {
-            area.top = area.top.max(monitor_info.rcMonitor.top + 41);
+            area.top = area.top.max(monitor_info.rcMonitor.top + BAR_HEIGHT);
         }
         Some(LayoutRect {
-            left: area.left + TILE_GAP,
-            top: area.top + TILE_GAP,
-            right: area.right - TILE_GAP,
-            bottom: area.bottom - TILE_GAP,
+            left: area.left + self.config.window_gap,
+            top: area.top + self.config.window_gap,
+            right: area.right - self.config.window_gap,
+            bottom: area.bottom - self.config.window_gap,
         })
     }
 
     fn layout_rects(&self, workspace: usize) -> Vec<(isize, LayoutRect)> {
         let mut output = Vec::new();
         if let (Some(root), Some(area)) = (self.layouts.get(&workspace), self.workspace_area(workspace)) {
-            root.rects(area, &mut output);
+            root.rects(area, self.config.window_gap, &mut output);
         }
         output
     }
 
     fn tile_workspace(&self, workspace: usize) {
         use windows::Win32::UI::WindowsAndMessaging::{
-            HWND_NOTOPMOST, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SetWindowPos,
+            BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, HWND_NOTOPMOST,
+            SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SetWindowPos,
         };
-        for (handle, rect) in self.layout_rects(workspace) {
-            if !self.windows.get(&handle).is_some_and(|window| !window.floating && window.fullscreen_restore.is_none()) { continue; }
-            let placement = window_placement_for_visible_rect(handle, rect);
+        let placements = self
+            .layout_rects(workspace)
+            .into_iter()
+            .filter(|(handle, _)| {
+                self.windows.get(handle).is_some_and(|window| {
+                    !window.floating
+                        && window.fullscreen_restore.is_none()
+                        && window.maximize_restore.is_none()
+                })
+            })
+            .map(|(handle, rect)| (handle, window_placement_for_visible_rect(handle, rect)))
+            .collect::<Vec<_>>();
+
+        let mut applied_as_batch = false;
+        if !placements.is_empty() {
             unsafe {
-                let _ = SetWindowPos(
-                    hwnd(handle),
-                    HWND_NOTOPMOST,
-                    placement.left,
-                    placement.top,
-                    (placement.right - placement.left).max(64),
-                    (placement.bottom - placement.top).max(64),
-                    SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING,
-                );
+                if let Ok(mut batch) = BeginDeferWindowPos(placements.len() as i32) {
+                    let mut valid = true;
+                    for (handle, placement) in &placements {
+                        match DeferWindowPos(
+                            batch,
+                            hwnd(*handle),
+                            HWND_NOTOPMOST,
+                            placement.left,
+                            placement.top,
+                            (placement.right - placement.left).max(64),
+                            (placement.bottom - placement.top).max(64),
+                            SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING,
+                        ) {
+                            Ok(next) => batch = next,
+                            Err(_) => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if valid {
+                        applied_as_batch = EndDeferWindowPos(batch).is_ok();
+                    }
+                }
+            }
+        }
+        if !applied_as_batch {
+            for (handle, placement) in placements {
+                unsafe {
+                    let _ = SetWindowPos(
+                        hwnd(handle),
+                        HWND_NOTOPMOST,
+                        placement.left,
+                        placement.top,
+                        (placement.right - placement.left).max(64),
+                        (placement.bottom - placement.top).max(64),
+                        SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING,
+                    );
+                }
             }
         }
         self.apply_borders();
     }
 
     fn reconcile_tiled_constraints(&mut self) -> bool {
-        let Some(area) = self.workspace_area(self.active_workspace) else { return false; };
+        if self.workspace_area(self.active_workspace).is_none() { return false; }
         let expected = self.layout_rects(self.active_workspace);
+        let single_tile = expected.len() == 1;
         let mut adjustment = None;
-        for (handle, rect) in expected {
-            if self.windows.get(&handle).is_some_and(|window| self.minimum_size_ignored(&window.process_name)) {
-                continue;
-            }
+        for (handle, rect) in &expected {
+            let (handle, rect) = (*handle, *rect);
             let Some(actual) = visible_window_rect(handle) else { continue; };
             let width_growth = (actual.right - actual.left) - (rect.right - rect.left);
             let height_growth = (actual.bottom - actual.top) - (rect.bottom - rect.top);
+            let stale_single_tile = single_tile
+                && ((actual.left - rect.left).abs() > 4
+                    || (actual.top - rect.top).abs() > 4
+                    || (actual.right - rect.right).abs() > 4
+                    || (actual.bottom - rect.bottom).abs() > 4);
+            if stale_single_tile {
+                // Firefox-family browsers can apply their persisted window
+                // rectangle shortly after the WM's initial placement. With no
+                // sibling there is no split ratio to absorb or protect, so the
+                // sole tiled window must always occupy the complete workspace
+                // instead of being left at that stale restored size.
+                self.pending_growth.remove(&handle);
+                self.tile_active_workspace();
+                return true;
+            }
             // Only absorb app-enforced growth. Shrinkage is normally a transient
             // placement frame and should still be corrected to the tree geometry.
             if width_growth > 4 || height_growth > 4 {
+                // Apps like Zen/Firefox can bounce through several internal
+                // resize steps while they settle (e.g. during startup), each
+                // one slightly bigger than the last. Absorbing and retiling
+                // on every single tick chased that moving target and visibly
+                // fought with neighboring windows the whole time it took to
+                // settle. Observe a short sequence and retain its largest
+                // enforced size before resolving it once. Pixel-identical
+                // samples are deliberately unnecessary: Firefox can
+                // oscillate slightly, which otherwise prevents an impossible
+                // tile from ever being moved away.
                 let outer = window_placement_for_visible_rect(handle, actual);
-                adjustment = Some((
-                    handle,
-                    width_growth.max(0),
-                    height_growth.max(0),
-                    (outer.right - outer.left, outer.bottom - outer.top),
-                ));
+                let observed = (outer.right - outer.left, outer.bottom - outer.top);
+                let pending = self.pending_growth.entry(handle).or_insert((0, 0, 0));
+                pending.0 = pending.0.max(observed.0);
+                pending.1 = pending.1.max(observed.1);
+                pending.2 = pending.2.saturating_add(1);
+                if pending.2 < 3 {
+                    continue;
+                }
+                adjustment = Some((handle, (pending.0, pending.1)));
                 break;
+            } else {
+                self.pending_growth.remove(&handle);
             }
         }
-        let Some((handle, width_growth, height_growth, inferred_minimum)) = adjustment else { return false; };
+        let Some((handle, inferred_minimum)) = adjustment else { return false; };
+        self.pending_growth.remove(&handle);
         let minimum = self.minimum_sizes.entry(handle).or_insert((64, 64));
         minimum.0 = minimum.0.max(inferred_minimum.0);
         minimum.1 = minimum.1.max(inferred_minimum.1);
-        let Some(root) = self.layouts.get_mut(&self.active_workspace) else { return false; };
-        let mut changed = false;
-        if width_growth > 4 {
-            changed |= root.resize_for(
-                handle,
-                TilingDirection::Horizontal,
-                width_growth as f32 / (area.right - area.left).max(1) as f32,
-            );
-        }
-        if height_growth > 4 {
-            changed |= root.resize_for(
-                handle,
-                TilingDirection::Vertical,
-                height_growth as f32 / (area.bottom - area.top).max(1) as f32,
-            );
-        }
-        if changed {
+
+        let workspace = self.active_workspace;
+        let Some(area) = self.workspace_area(workspace) else { return false; };
+        let Some(original) = self.layouts.get(&workspace).cloned() else { return false; };
+
+        // First preserve the current tree and adjust its ratios. If that
+        // cannot satisfy the newly learned minimum, try every useful row/
+        // column insertion before deciding that another workspace is needed.
+        let mut fitted = original.clone();
+        if self.constrain_layout_to_minimum(&mut fitted, area) {
+            self.layouts.insert(workspace, fitted);
             self.tile_active_workspace();
+            return true;
         }
-        changed
+
+        if let Some(remaining) = original.clone().remove(handle)
+            && let Some(alternate) = self.find_fitting_insertion(&remaining, area, handle)
+        {
+            self.layouts.insert(workspace, alternate);
+            self.tile_active_workspace();
+            return true;
+        }
+
+        // The window genuinely cannot coexist with the other tiles. Move it
+        // to a fresh workspace rather than repeatedly fighting its enforced
+        // dimensions. Follow a foreground/active launch; otherwise leave the
+        // user on the current workspace and park the relocated window.
+        let should_follow = self.focused == Some(handle)
+            || self.last_foreground_event.is_some_and(|(foreground, received)| {
+                foreground == handle && received.elapsed() < Duration::from_secs(1)
+            });
+        let destination = self.next_available_workspace();
+        self.relocate_window_to_workspace(handle, destination);
+        if should_follow {
+            self.focus_workspace(destination);
+        } else {
+            self.park_window(handle);
+            self.sync_taskbar_visibility();
+            self.focus_active_replacement();
+        }
+        WINDOW_EVENT_DIRTY.store(true, Ordering::Release);
+        true
     }
+
+
 
     fn update_snap_target(&mut self) {
         use windows::Win32::Foundation::POINT;
@@ -1568,7 +2342,7 @@ impl Manager {
             return Vec::new();
         }
         let mut rects = Vec::new();
-        root.rects(area, &mut rects);
+        root.rects(area, self.config.window_gap, &mut rects);
         rects
     }
 
@@ -1647,8 +2421,14 @@ impl Manager {
         let accent = native_accent_colorref();
         // COLORREF is 0x00BBGGRR: #767F84 -> 0x00847F76.
         let unfocused = 0x0084_7f76_u32;
+        // DWM's documented sentinel restores the system-selected border,
+        // which is effectively invisible against a window that already
+        // covers the whole monitor (native maximize / fullscreen).
+        let default_border = 0xffff_ffff_u32;
         for window in self.windows.values() {
-            let color = if self.focused == Some(window.handle) {
+            let color = if window.maximize_restore.is_some() || window.fullscreen_restore.is_some() {
+                default_border
+            } else if self.focused == Some(window.handle) {
                 accent
             } else {
                 unfocused
@@ -1665,7 +2445,81 @@ impl Manager {
     }
 
     fn apply_foreground_event(&mut self, handle: isize) {
+        if SEARCH_INPUT_ACTIVE.load(Ordering::Acquire) {
+            self.pending_workspace_focus = None;
+            return;
+        }
+        // Minimizing (e.g. clicking the active window's taskbar icon) makes
+        // Windows activate the next window in z-order, which can be a parked
+        // window of another workspace. That is a fallback, not a user choice:
+        // don't switch workspaces for it, and don't undo the minimize.
+        if self.windows.get(&handle).is_some_and(|window| window.workspace != self.active_workspace) {
+            use windows::Win32::UI::WindowsAndMessaging::IsIconic;
+            let recent_local = self
+                .last_local_foreground
+                .filter(|(_, at)| at.elapsed() < Duration::from_secs(3))
+                .map(|(local, _)| local);
+            let minimized = [recent_local, self.focused, self.pending_workspace_focus.map(|(_, pending, _)| pending)]
+                .into_iter()
+                .flatten()
+                .find(|candidate| {
+                    self.windows.get(candidate).is_some_and(|window| window.workspace == self.active_workspace)
+                        && unsafe { IsIconic(hwnd(*candidate)) }.as_bool()
+                });
+            if let Some(minimized) = minimized {
+                self.pending_workspace_focus = None;
+                self.focus_after_local_minimize(minimized);
+                return;
+            }
+        }
+        if self.suppress_close_induced_workspace_activation(handle) {
+            return;
+        }
+        if self.is_stale_cross_workspace_activation(handle) {
+            return;
+        }
+        if self.recently_parked.get(&handle).is_some_and(|parked_at| {
+            parked_at.elapsed() < Duration::from_millis(600)
+        }) {
+            // `SetWindowPos`'s off-screen move in `park_window` can make Windows
+            // briefly re-foreground the window being parked before our own
+            // `focus_native_window` call lands on the real target. That is
+            // stale noise from our own transition, not a new user activation -
+            // but a genuine taskbar click on this same (now hidden) window can
+            // also land inside this window, so only actually suppress it when
+            // the OS's live foreground window has already moved on to
+            // something else; if this handle really is the current foreground
+            // window, the user's click won a real activation and must be
+            // honored (e.g. redirected or used to spawn a new Explorer window).
+            use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+            let live_foreground = unsafe { GetForegroundWindow() }.0 as isize;
+            if live_foreground != handle {
+                return;
+            }
+        }
+        if let Some((pending_workspace, pending, _)) = self.pending_workspace_focus
+            && pending != handle
+        {
+            let event_workspace = self.windows.get(&handle).map(|window| window.workspace);
+            if event_workspace.is_some_and(|workspace| workspace != pending_workspace) {
+                // Parking/unparking and taskbar updates can foreground an old
+                // workspace window while the requested workspace is settling.
+                // It is part of the same transaction, not a new user choice.
+                return;
+            }
+            if event_workspace == Some(pending_workspace) {
+                // The user selected a different window inside the destination
+                // workspace; that is a legitimate replacement for our target.
+                self.pending_workspace_focus = None;
+            }
+        }
         self.last_foreground_event = Some((handle, Instant::now()));
+        if self.windows.get(&handle).is_some_and(|window| window.workspace == self.active_workspace) {
+            self.last_local_foreground = Some((handle, Instant::now()));
+        }
+        if self.activate_external_window(handle) {
+            return;
+        }
         let focused = self.windows.get(&handle)
             .filter(|window| window.workspace == self.active_workspace)
             .map(|window| window.handle);
@@ -1677,6 +2531,197 @@ impl Manager {
         // updated. Applying its HWND directly avoids leaving the old accent border
         // visible until the fallback scan runs.
         self.apply_borders();
+    }
+
+    /// A foreground/restore notification for a window of another workspace is
+    /// only a deliberate request when that window really is the foreground
+    /// window now. Parked windows get transiently activated by Windows (z-order
+    /// fallbacks after minimize, repeated taskbar clicks) while the user's
+    /// window keeps or regains focus; switching workspaces for those is the
+    /// "random jump".
+    fn is_stale_cross_workspace_activation(&self, handle: isize) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        self.windows.get(&handle).is_some_and(|window| window.workspace != self.active_workspace)
+            && unsafe { GetForegroundWindow() }.0 as isize != handle
+    }
+
+    fn focus_after_local_minimize(&mut self, minimized: isize) {
+        use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, IsIconic, SetForegroundWindow};
+        let replacement = self
+            .last_focused
+            .get(&self.active_workspace)
+            .copied()
+            .into_iter()
+            .chain(
+                self.windows
+                    .values()
+                    .filter(|window| window.workspace == self.active_workspace)
+                    .map(|window| window.handle),
+            )
+            .find(|candidate| {
+                *candidate != minimized
+                    && self.windows.get(candidate).is_some_and(|window| {
+                        window.workspace == self.active_workspace && !self.closing.contains(candidate)
+                    })
+                    && !unsafe { IsIconic(hwnd(*candidate)) }.as_bool()
+            });
+        if let Some(local) = replacement {
+            focus_native_window(local);
+            self.focused = Some(local);
+            self.last_focused.insert(self.active_workspace, local);
+            self.last_foreground_event = Some((local, Instant::now()));
+            self.pending_workspace_focus = Some((self.active_workspace, local, Instant::now()));
+        } else {
+            self.focused = None;
+            self.last_foreground_event = None;
+            let shell = unsafe { GetShellWindow() };
+            if !shell.is_invalid() {
+                unsafe { let _ = SetForegroundWindow(shell); }
+            }
+        }
+        self.apply_borders();
+    }
+
+    /// Reveals a managed window that an external UI surface (taskbar, tray,
+    /// notification, app IPC) activated from another workspace.
+    fn activate_external_window(&mut self, handle: isize) -> bool {
+        let Some(workspace) = self.windows.get(&handle).map(|window| window.workspace) else {
+            return false;
+        };
+        if workspace == self.active_workspace {
+            return false;
+        }
+        if self.redirect_hidden_app_activation(handle) {
+            return true;
+        }
+        if self.workspace_switch_guard.is_some_and(|(target, started)| {
+            target == self.active_workspace
+                && workspace != target
+                && started.elapsed() < Duration::from_millis(650)
+        }) {
+            return true;
+        }
+        self.last_focused.insert(workspace, handle);
+        self.focus_workspace(workspace);
+        self.focused = Some(handle);
+        self.pending_workspace_focus = Some((workspace, handle, Instant::now()));
+        self.apply_borders();
+        true
+    }
+
+    /// Windows keeps taskbar groups global even after an individual HWND tab
+    /// is removed with ITaskbarList. A repeated click can therefore activate
+    /// a hidden sibling from another Overbar workspace. Keep that activation
+    /// local when this workspace already owns an instance of the same app.
+    /// Explorer is single-instance at the process level, so if there is no
+    /// local Explorer window, explicitly ask it for a new window instead.
+    fn redirect_hidden_app_activation(&mut self, handle: isize) -> bool {
+        if !self.taskbar_hidden.contains(&handle) {
+            return false;
+        }
+        let Some(process) = self.windows.get(&handle).map(|window| {
+            window.process_name.trim_end_matches(".exe").to_ascii_lowercase()
+        }) else {
+            return false;
+        };
+        let local = self
+            .last_focused
+            .get(&self.active_workspace)
+            .copied()
+            .filter(|candidate| {
+                self.windows.get(candidate).is_some_and(|window| {
+                    window.workspace == self.active_workspace
+                        && window.process_name.trim_end_matches(".exe").eq_ignore_ascii_case(&process)
+                })
+            })
+            .or_else(|| {
+                self.windows.values().find_map(|window| {
+                    (window.workspace == self.active_workspace
+                        && window.process_name.trim_end_matches(".exe").eq_ignore_ascii_case(&process))
+                        .then_some(window.handle)
+                })
+            });
+        if let Some(local) = local {
+            focus_native_window(local);
+            self.focused = Some(local);
+            self.last_focused.insert(self.active_workspace, local);
+            self.last_foreground_event = Some((local, Instant::now()));
+            self.pending_workspace_focus = Some((self.active_workspace, local, Instant::now()));
+            self.apply_borders();
+            return true;
+        }
+
+        if process == "explorer" {
+            // The pending flag normally gates re-spawns until `refresh()`
+            // discovers the new window, but if that somehow never happens
+            // (e.g. the spawn failed) don't block Explorer relaunches forever.
+            if self.pending_explorer_relaunch.is_some()
+                && self.last_explorer_relaunch.elapsed() >= Duration::from_secs(8)
+            {
+                self.pending_explorer_relaunch = None;
+            }
+            let will_relaunch = self.pending_explorer_relaunch.is_none()
+                && self.last_explorer_relaunch.elapsed() >= Duration::from_millis(750);
+            if will_relaunch {
+                self.last_explorer_relaunch = Instant::now();
+                // Remember which workspace asked for the window: Explorer can
+                // take seconds to show it, by which point the user may have
+                // switched away and it must not land on the wrong workspace.
+                self.pending_explorer_relaunch = Some(self.active_workspace);
+                // Overbar runs elevated, and an elevated explorer.exe cannot
+                // hand the request to the user's (non-elevated) shell, so it
+                // is flaky or never opens a window. Folder paths via
+                // ShellExecute reuse an already-open window of that folder.
+                // Running plain `explorer.exe` with the shell's own token
+                // behaves like the taskbar button: always a new default window.
+                if spawn_unelevated_explorer().is_err() {
+                    use windows::{
+                        Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
+                        core::{PCWSTR, w},
+                    };
+                    let _ = unsafe {
+                        ShellExecuteW(None, w!("open"), w!("explorer.exe"), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL)
+                    };
+                }
+                WINDOW_EVENT_DIRTY.store(true, Ordering::Release);
+            }
+            // Never let the hidden Explorer HWND pull this workspace away
+            // while its new local window is being created and discovered.
+            if let Some(local) = self.preferred_workspace_window(self.active_workspace) {
+                focus_native_window(local);
+                self.last_foreground_event = Some((local, Instant::now()));
+                self.pending_workspace_focus = Some((self.active_workspace, local, Instant::now()));
+            } else {
+                self.last_foreground_event = None;
+                use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, SetForegroundWindow};
+                let shell = unsafe { GetShellWindow() };
+                if !shell.is_invalid() {
+                    unsafe { let _ = SetForegroundWindow(shell); }
+                }
+            }
+            return true;
+        }
+
+        false
+    }
+
+    fn note_window_departure(&mut self, handle: isize) {
+        if let Some(window) = self.windows.get(&handle)
+            && window.workspace == self.active_workspace
+        {
+            self.last_workspace_departure = Some((window.workspace, Instant::now()));
+        }
+    }
+
+    fn suppress_close_induced_workspace_activation(&self, handle: isize) -> bool {
+        let Some(target_workspace) = self.windows.get(&handle).map(|window| window.workspace) else {
+            return false;
+        };
+        target_workspace != self.active_workspace
+            && self.last_workspace_departure.is_some_and(|(workspace, occurred)| {
+                workspace == self.active_workspace
+                    && occurred.elapsed() < Duration::from_millis(350)
+            })
     }
 
     fn restore_windows(&self) {
@@ -1919,7 +2964,8 @@ fn configured_hotkeys(
         (208, "Focus up"), (209, "Focus down"),
         (203, "Move left"), (204, "Move right"),
         (210, "Move up"), (211, "Move down"),
-        (205, "Tiling direction"), (212, "Toggle floating"),
+        (205, "Tiling direction"), (212, "Set Tiled"),
+        (206, "Cycle tiled/floating"),
         (213, "Fullscreen"), (214, "Minimize"), (215, "Close"),
         (216, "Previous workspace"), (217, "Next workspace"),
         (218, "Recent workspace"), (219, "Retile"), (234, "Resize mode"),
@@ -1937,7 +2983,6 @@ fn fixed_hotkey_aliases(
         MOD_ALT, MOD_NOREPEAT, MOD_SHIFT, VK_DOWN, VK_LEFT, VK_RIGHT, VK_UP,
     };
     vec![
-        (206, MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, 0x20),
         (207, MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, b'P' as u32),
         (220, MOD_ALT | MOD_NOREPEAT, VK_LEFT.0 as u32),
         (221, MOD_ALT | MOD_NOREPEAT, VK_RIGHT.0 as u32),
@@ -2009,7 +3054,8 @@ fn run_windows_manager(
             WindowsAndMessaging::{
                 DispatchMessageW, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
                 EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_SHOW,
-                EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART,
+                EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MOVESIZEEND,
+                EVENT_SYSTEM_MOVESIZESTART,
                 MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
                 WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_HOTKEY,
             },
@@ -2050,6 +3096,17 @@ fn run_windows_manager(
             flags,
         )
     };
+    let restore_hook = unsafe {
+        SetWinEventHook(
+            EVENT_SYSTEM_MINIMIZEEND,
+            EVENT_SYSTEM_MINIMIZEEND,
+            HMODULE::default(),
+            Some(window_event_callback),
+            0,
+            0,
+            flags,
+        )
+    };
 
     // Alt+1..9 switches workspaces; Alt+Shift+1..9 moves the focused window.
     for number in 1..=9_i32 {
@@ -2066,7 +3123,6 @@ fn run_windows_manager(
     // User-configurable actions plus fixed arrow/resize/monitor aliases.
     let mut hotkeys = configured_hotkeys(&config);
     hotkeys.extend([
-        (206, MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, 0x20),
         (207, MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, b'P' as u32),
         (220, MOD_ALT | MOD_NOREPEAT, VK_LEFT.0 as u32),
         (221, MOD_ALT | MOD_NOREPEAT, VK_RIGHT.0 as u32),
@@ -2098,6 +3154,7 @@ fn run_windows_manager(
     let mut snap_preview = SnapPreviewOverlay::default();
     let mut last_direction = manager.direction;
     let mut last_floating = None;
+    let mut last_resize_mode = None;
     let mut last_border_refresh = Instant::now() - Duration::from_secs(1);
     let mut last_composition_refresh = Instant::now() - Duration::from_secs(1);
     let mut last_fallback_scan = Instant::now() - Duration::from_secs(1);
@@ -2107,10 +3164,25 @@ fn run_windows_manager(
         let mut force_publish = false;
         let queued_events = WINDOW_EVENTS.get_or_init(Default::default)
             .lock().map(|mut events| std::mem::take(&mut *events)).unwrap_or_default();
+        // Foreground and destroy/hide notifications from one close can arrive
+        // in either order. Mark departures for the whole batch first so a
+        // foreground fallback from another workspace cannot be mistaken for
+        // an intentional tray/taskbar activation.
+        for (event, handle) in &queued_events {
+            if *event == EVENT_OBJECT_DESTROY || *event == EVENT_OBJECT_HIDE {
+                manager.note_window_departure(*handle);
+            }
+        }
         for (event, handle) in queued_events {
             if event == EVENT_SYSTEM_FOREGROUND {
                 manager.apply_foreground_event(handle);
                 force_publish = true;
+            } else if event == EVENT_SYSTEM_MINIMIZEEND {
+                if manager.is_stale_cross_workspace_activation(handle) {
+                    // Parked window restored/activated by the OS, not the user.
+                } else if manager.activate_external_window(handle) {
+                    force_publish = true;
+                }
             } else if event == EVENT_OBJECT_DESTROY {
                 if manager.dragging == Some(handle) {
                     manager.dragging = None;
@@ -2155,7 +3227,6 @@ fn run_windows_manager(
                 }
                 WindowManagerCommand::CloseWindow(handle) => {
                     manager.close_window(handle);
-                    force_publish = true;
                 }
                 WindowManagerCommand::FocusWindow { handle, workspace } => {
                     if let Ok(workspace) = workspace.parse() {
@@ -2234,7 +3305,7 @@ fn run_windows_manager(
                     }
                     207 => manager.toggle_paused(),
                     212 => {
-                        if manager.toggle_floating() {
+                        if manager.set_tiled() {
                             let _ = updates.send(WindowManagerUpdate::ConfigChanged(manager.config.clone()));
                         }
                     }
@@ -2269,7 +3340,12 @@ fn run_windows_manager(
                     243 => manager.move_workspace_to_monitor(0, 1),
                     _ => {}
                 }
-                force_publish = true;
+                // Closing is asynchronous. Publish/recompose only after the
+                // real hide/destroy event, not while the old HWND is still
+                // drawing over the layout it is about to leave.
+                if id != 215 {
+                    force_publish = true;
+                }
             } else {
                 unsafe {
                     let _ = TranslateMessage(&message);
@@ -2286,6 +3362,9 @@ fn run_windows_manager(
             let (changed, layout_changed) = manager.refresh();
             if layout_changed && !manager.paused {
                 manager.tile_active_workspace();
+            }
+            if layout_changed && manager.focused.is_none() {
+                manager.focus_active_replacement();
             }
             force_publish |= changed;
         }
@@ -2307,6 +3386,16 @@ fn run_windows_manager(
             if updates.send(WindowManagerUpdate::Floating(focused_floating)).is_err() { break; }
             ctx.request_repaint();
         }
+        if last_resize_mode != Some(manager.resize_mode) {
+            last_resize_mode = Some(manager.resize_mode);
+            if updates
+                .send(WindowManagerUpdate::ResizeMode(manager.resize_mode))
+                .is_err()
+            {
+                break;
+            }
+            ctx.request_repaint();
+        }
         let composition_due = force_publish
             || (manager.dragging.is_some()
                 && last_composition_refresh.elapsed() >= Duration::from_millis(50));
@@ -2317,19 +3406,15 @@ fn run_windows_manager(
             ctx.request_repaint();
         }
         if last_border_refresh.elapsed() >= Duration::from_millis(75) {
+            if manager.dragging.is_none() {
+                manager.sync_native_maximize(&updates);
+                ctx.request_repaint();
+            }
             manager.enforce_workspace_visibility();
             if !manager.paused && manager.dragging.is_none() {
-                let has_forced_window = manager.windows.values().any(|window| {
-                    window.workspace == manager.active_workspace
-                        && !window.floating
-                        && manager.minimum_size_ignored(&window.process_name)
-                });
-                if has_forced_window {
-                    manager.tile_workspace(manager.active_workspace);
-                }
-                // Firefox-family windows can enforce a chrome minimum after
-                // placement. Absorb that once into the split tree instead of
-                // fighting the app between two sizes forever.
+                // Firefox-family windows (including Zen) can enforce a chrome
+                // minimum after placement. Absorb that once into the split
+                // tree instead of fighting the app between two sizes forever.
                 if manager.reconcile_tiled_constraints() {
                     let _ = updates.send(WindowManagerUpdate::LayoutChanged);
                     last_composition_refresh = Instant::now();
@@ -2371,6 +3456,9 @@ fn run_windows_manager(
     }
     if !move_size_hook.is_invalid() {
         unsafe { let _ = UnhookWinEvent(move_size_hook); }
+    }
+    if !restore_hook.is_invalid() {
+        unsafe { let _ = UnhookWinEvent(restore_hook); }
     }
 }
 
@@ -2433,21 +3521,25 @@ unsafe extern "system" fn window_event_callback(
     _event_time: u32,
 ) {
     use windows::Win32::UI::WindowsAndMessaging::{
-        EVENT_OBJECT_DESTROY, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MOVESIZEEND,
-        EVENT_SYSTEM_MOVESIZESTART, OBJID_WINDOW,
+        EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND,
+        EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART,
+        OBJID_WINDOW,
     };
     if event == EVENT_SYSTEM_FOREGROUND {
         if let Ok(mut events) = WINDOW_EVENTS.get_or_init(Default::default).lock() {
             events.push((event, event_hwnd.0 as isize));
         }
-    } else if event == EVENT_SYSTEM_MOVESIZESTART || event == EVENT_SYSTEM_MOVESIZEEND {
+    } else if event == EVENT_SYSTEM_MOVESIZESTART
+        || event == EVENT_SYSTEM_MOVESIZEEND
+        || event == EVENT_SYSTEM_MINIMIZEEND
+    {
         if !event_hwnd.is_invalid() {
             if let Ok(mut events) = WINDOW_EVENTS.get_or_init(Default::default).lock() {
                 events.push((event, event_hwnd.0 as isize));
             }
         }
     }
-    if event == EVENT_OBJECT_DESTROY
+    if (event == EVENT_OBJECT_DESTROY || event == EVENT_OBJECT_HIDE || event == EVENT_OBJECT_SHOW)
         && (object_id == OBJID_WINDOW.0 || object_id == 0)
         && child_id == 0
         && !event_hwnd.is_invalid()
@@ -2525,14 +3617,22 @@ fn enumerate_monitors() -> Vec<(isize, windows::Win32::Foundation::RECT)> {
 fn inspect_window(handle: windows::Win32::Foundation::HWND) -> Option<ManagedWindow> {
     use windows::Win32::{
         Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute},
+        System::Threading::GetCurrentProcessId,
         UI::WindowsAndMessaging::{
             GWL_EXSTYLE, GWL_STYLE, GW_OWNER, GetClassNameW, GetWindow, GetWindowLongW,
-            GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsWindowVisible, WS_CHILD,
-            WS_EX_TOOLWINDOW, WS_THICKFRAME,
+            GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+            IsWindowVisible, WS_CHILD, WS_EX_TOOLWINDOW, WS_THICKFRAME,
         },
     };
 
     if handle.is_invalid() || !unsafe { IsWindowVisible(handle) }.as_bool() {
+        return None;
+    }
+    let mut process_id = 0_u32;
+    unsafe { GetWindowThreadProcessId(handle, Some(&mut process_id)) };
+    if process_id == 0 || process_id == unsafe { GetCurrentProcessId() } {
+        // Exclude every Overbar-owned viewport by identity. Titles can be delayed,
+        // localized, or briefly empty while eframe recreates an overlay HWND.
         return None;
     }
     let style = unsafe { GetWindowLongW(handle, GWL_STYLE) } as u32;
@@ -2585,23 +3685,17 @@ fn inspect_window(handle: windows::Win32::Foundation::HWND) -> Option<ManagedWin
     let title = String::from_utf16_lossy(&title_buffer[..copied as usize])
         .trim()
         .to_owned();
-    let shell_title = title.eq_ignore_ascii_case("Program Manager")
-        || title.eq_ignore_ascii_case("System tray overflow window")
-        || title.eq_ignore_ascii_case("Task Switching")
-        || title.eq_ignore_ascii_case("Notification Center");
-    let shell_class = matches!(
-        class_name.as_str(),
-        "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
-            | "TopLevelWindowForOverflowXamlIsland" | "MultitaskingViewFrame"
-    );
-    if title.is_empty() || title.starts_with("Overbar") || shell_title || shell_class {
+    let raw_process_name = window_process_name(handle).unwrap_or_else(|| "Application".into());
+    if title.is_empty()
+        || title.starts_with("Overbar")
+        || is_shell_surface_title(&title, &class_name, &raw_process_name)
+    {
         return None;
     }
-    let process_name = window_process_name(handle).unwrap_or_else(|| "Application".into());
-    let process_name = if process_name.eq_ignore_ascii_case("ApplicationFrameHost.exe") {
+    let process_name = if raw_process_name.eq_ignore_ascii_case("ApplicationFrameHost.exe") {
         title.clone()
     } else {
-        process_name.trim_end_matches(".exe").to_owned()
+        raw_process_name.trim_end_matches(".exe").to_owned()
     };
     let mut original = windows::Win32::Foundation::RECT::default();
     if unsafe { GetWindowRect(handle, &mut original) }.is_err() {
@@ -2633,11 +3727,13 @@ fn inspect_window(handle: windows::Win32::Foundation::HWND) -> Option<ManagedWin
         workspace: 1,
         floating: transient || style & WS_THICKFRAME.0 == 0,
         fullscreen_restore: None,
+        maximize_restore: None,
+        native_maximized: false,
     })
 }
 
 #[cfg(target_os = "windows")]
-fn window_process_name(handle: windows::Win32::Foundation::HWND) -> Option<String> {
+pub(super) fn window_process_name(handle: windows::Win32::Foundation::HWND) -> Option<String> {
     use windows::{
         Win32::{
             Foundation::CloseHandle,
@@ -2745,7 +3841,6 @@ fn focus_native_window(handle: isize) {
     use windows::Win32::{
         System::Threading::{AttachThreadInput, GetCurrentThreadId},
         UI::{
-            Input::KeyboardAndMouse::{SetActiveWindow, SetFocus},
             WindowsAndMessaging::{
                 BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, IsIconic,
                 SW_RESTORE, SetForegroundWindow, ShowWindowAsync,
@@ -2759,8 +3854,6 @@ fn focus_native_window(handle: isize) {
             let _ = ShowWindowAsync(target, SW_RESTORE);
         }
         if SetForegroundWindow(target).as_bool() {
-            let _ = SetActiveWindow(target);
-            let _ = SetFocus(target);
             return;
         }
 
@@ -2780,8 +3873,6 @@ fn focus_native_window(handle: isize) {
 
         let _ = BringWindowToTop(target);
         let _ = SetForegroundWindow(target);
-        let _ = SetActiveWindow(target);
-        let _ = SetFocus(target);
 
         if attached_target {
             let _ = AttachThreadInput(current_thread, target_thread, false);
@@ -2925,6 +4016,8 @@ mod tests {
             workspace: 1,
             floating: false,
             fullscreen_restore: None,
+            maximize_restore: None,
+            native_maximized: false,
         };
         let host = window("document.txt - Editor", None);
         let open_dialog = window("Open", Some(10));
@@ -2946,6 +4039,7 @@ mod tests {
                 right: 1000,
                 bottom: 800,
             },
+            crate::DEFAULT_WM_GAP,
             &mut rects,
         );
         let first = rects.iter().find(|(handle, _)| *handle == 1).unwrap().1;
@@ -2968,12 +4062,66 @@ mod tests {
                 right: 1000,
                 bottom: 800,
             },
+            crate::DEFAULT_WM_GAP,
             &mut rects,
         );
         let left = rects.iter().find(|(handle, _)| *handle == 1).unwrap().1;
         let right = rects.iter().find(|(handle, _)| *handle == 2).unwrap().1;
         assert!(left.right - left.left > right.right - right.left);
-        assert_eq!(right.left - left.right, TILE_GAP);
+        assert_eq!(right.left - left.right, crate::DEFAULT_WM_GAP);
+    }
+
+    #[test]
+    fn directional_resize_moves_the_boundary_consistently_from_either_side() {
+        let area = LayoutRect {
+            left: 0,
+            top: 0,
+            right: 1000,
+            bottom: 800,
+        };
+        let mut from_left = LayoutNode::Leaf(1);
+        from_left.insert_beside(1, 2, TilingDirection::Horizontal, true);
+        assert!(from_left.move_boundary_for(1, TilingDirection::Horizontal, 0.1));
+        let mut left_rects = Vec::new();
+        from_left.rects(area, crate::DEFAULT_WM_GAP, &mut left_rects);
+        let grown_left = left_rects.iter().find(|(handle, _)| *handle == 1).unwrap().1;
+
+        let mut from_right = LayoutNode::Leaf(1);
+        from_right.insert_beside(1, 2, TilingDirection::Horizontal, true);
+        assert!(from_right.move_boundary_for(2, TilingDirection::Horizontal, 0.1));
+        let mut right_rects = Vec::new();
+        from_right.rects(area, crate::DEFAULT_WM_GAP, &mut right_rects);
+        let shrunk_right = right_rects.iter().find(|(handle, _)| *handle == 2).unwrap().1;
+
+        assert!(grown_left.right - grown_left.left > 500);
+        assert!(shrunk_right.right - shrunk_right.left < 500);
+    }
+
+    #[test]
+    fn removing_a_new_leaf_beside_an_earlier_window_restores_the_prior_tree() {
+        let area = LayoutRect {
+            left: 0,
+            top: 0,
+            right: 1600,
+            bottom: 900,
+        };
+        let mut root = LayoutNode::Leaf(1);
+        assert!(root.insert_beside(1, 2, TilingDirection::Horizontal, true));
+        assert!(root.insert_beside(2, 3, TilingDirection::Vertical, true));
+        let before = root.clone();
+
+        // Reproduces: focus the first of three apps, open a fourth beside it,
+        // then close that new app.
+        assert!(root.insert_beside(1, 4, TilingDirection::Vertical, true));
+        root = root.remove(4).expect("the original three-window tree remains");
+
+        let mut expected = Vec::new();
+        before.rects(area, crate::DEFAULT_WM_GAP, &mut expected);
+        let mut actual = Vec::new();
+        root.rects(area, crate::DEFAULT_WM_GAP, &mut actual);
+        expected.sort_by_key(|(handle, _)| *handle);
+        actual.sort_by_key(|(handle, _)| *handle);
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -2993,6 +4141,8 @@ mod tests {
                 workspace: 1,
                 floating: false,
                 fullscreen_restore: None,
+                maximize_restore: None,
+                native_maximized: false,
             },
         );
         let state = manager.state();

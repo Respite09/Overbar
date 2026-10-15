@@ -1,6 +1,6 @@
 [package]
 name = "overbar"
-version = "0.1.0"
+version = "1.1.0"
 edition = "2024"
 
 [dependencies]
@@ -13,6 +13,8 @@ sysinfo = "0.32"
 [target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6"
 windows = { version = "0.58", features = [
+    "Foundation",
+    "Media_Control",
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
@@ -26,6 +28,7 @@ windows = { version = "0.58", features = [
     "Win32_System_Registry",
     "Win32_System_Shutdown",
     "Win32_System_Threading",
+    "Win32_System_WinRT",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Accessibility",
     "Win32_UI_Shell",
