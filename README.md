@@ -1,4 +1,6 @@
 # Overbar
+<img width="1920" height="1199" alt="image" src="https://github.com/user-attachments/assets/79754e03-0d45-4e00-a539-34fa933e76d8" />
+
 
 A lightweight native Windows topbar and tiling window manager written in Rust.
 
