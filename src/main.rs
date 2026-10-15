@@ -4770,9 +4770,7 @@ impl App for OverbarApp {
             }
         }
         while let Ok(title) = self.title_updates.try_recv() {
-            if !title.starts_with("Overbar") {
-                self.active_title = title;
-            }
+            self.active_title = title;
         }
         while self.search_shortcuts.try_recv().is_ok() {
             self.activate_search(ctx);
@@ -7044,8 +7042,12 @@ fn spawn_search_shortcut_worker(_ctx: Context, _running: Arc<AtomicBool>) -> Rec
 
 #[cfg(target_os = "windows")]
 fn spawn_title_worker(ctx: Context, running: Arc<AtomicBool>) -> Receiver<String> {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetClassNameW, GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW,
+    use windows::Win32::{
+        System::Threading::GetCurrentProcessId,
+        UI::WindowsAndMessaging::{
+            GetClassNameW, GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW,
+            GetWindowThreadProcessId,
+        },
     };
 
     let (sender, receiver) = mpsc::channel();
@@ -7056,6 +7058,12 @@ fn spawn_title_worker(ctx: Context, running: Arc<AtomicBool>) -> Receiver<String
             while running.load(Ordering::Acquire) {
                 let hwnd = unsafe { GetForegroundWindow() };
                 if !hwnd.is_invalid() {
+                    let mut process_id = 0_u32;
+                    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
+                    if process_id == unsafe { GetCurrentProcessId() } {
+                        thread::sleep(Duration::from_millis(40));
+                        continue;
+                    }
                     let mut class_buffer = [0_u16; 256];
                     let class_length = unsafe { GetClassNameW(hwnd, &mut class_buffer) }
                         .max(0) as usize;
@@ -7076,7 +7084,9 @@ fn spawn_title_worker(ctx: Context, running: Arc<AtomicBool>) -> Receiver<String
                     } else {
                         String::new()
                     };
-                    let title = if is_shell_surface_title(&title, &class_name, &process_name) {
+                    let title = if is_shell_surface_title(&title, &class_name, &process_name)
+                        || is_transient_title_surface(hwnd, &class_name)
+                    {
                         "Type here to search...".to_owned()
                     } else {
                         title
@@ -7102,24 +7112,55 @@ fn is_shell_surface_title(title: &str, class_name: &str, process_name: &str) -> 
         .trim()
         .trim_end_matches(".exe")
         .to_ascii_lowercase();
-    matches!(
+    let shell_class = matches!(
         class_name.as_str(),
         "progman" | "workerw" | "shell_traywnd" | "shell_secondarytraywnd"
             | "notifyiconoverflowwindow" | "toplevelwindowforoverflowxamlisland"
             | "multitaskingviewframe" | "tasklistthumbnailwnd" | "tasklistoverlaywnd"
             | "xaml_windowedpopupclass" | "foregroundstaging" | "immersivelauncher"
             | "launchertipwnd" | "tooltips_class32" | "#32768"
-    ) || matches!(
+    );
+    let shell_process = matches!(
         process_name.as_str(),
         "popuphost" | "shellexperiencehost" | "startmenuexperiencehost"
             | "searchhost" | "searchapp" | "textinputhost" | "widgets"
             | "lockapp" | "securityhealthsystray"
-    ) || matches!(
+    );
+    let shell_title = matches!(
         title.as_str(),
         "program manager" | "system tray overflow window" | "task switching"
             | "notification center" | "action center" | "jump list" | "jumplist"
             | "popuphost" | "windows shell experience host"
-    )
+    );
+    shell_class || shell_process || (process_name == "explorer" && shell_title)
+}
+
+fn is_transient_title_class(class_name: &str) -> bool {
+    let class_name = class_name.trim().to_ascii_lowercase();
+    class_name.contains("popup")
+        || class_name.contains("tooltip")
+        || class_name.contains("flyout")
+        || class_name.contains("qmenu")
+        || class_name.contains("traymenu")
+}
+
+#[cfg(target_os = "windows")]
+fn is_transient_title_surface(
+    hwnd: windows::Win32::Foundation::HWND,
+    class_name: &str,
+) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GWL_STYLE, GetWindowLongW, WS_CAPTION, WS_EX_TOOLWINDOW, WS_POPUP,
+    };
+
+    if is_transient_title_class(class_name) {
+        return true;
+    }
+    let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32;
+    let ex_style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
+    style & WS_POPUP.0 != 0
+        && style & WS_CAPTION.0 == 0
+        && ex_style & WS_EX_TOOLWINDOW.0 != 0
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -8226,6 +8267,21 @@ mod tests {
             "CabinetWClass",
             "explorer.exe",
         ));
+        assert!(!is_shell_surface_title(
+            "Overbar: a Windows topbar · GitHub",
+            "MozillaWindowClass",
+            "zen.exe",
+        ));
+        assert!(!is_shell_surface_title(
+            "Jump List",
+            "MozillaWindowClass",
+            "zen.exe",
+        ));
+        assert!(is_transient_title_class(
+            "Qt5152QWindowPopupDropShadowSaveBits"
+        ));
+        assert!(is_transient_title_class("TrayMenuWindow"));
+        assert!(!is_transient_title_class("MozillaWindowClass"));
     }
 
     #[test]

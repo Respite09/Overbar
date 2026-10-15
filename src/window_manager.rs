@@ -542,7 +542,7 @@ impl Manager {
     }
 
     fn refresh(&mut self) -> (bool, bool) {
-        use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, IsIconic, IsWindow};
+        use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, IsWindow};
 
         self.closing.retain(|handle| unsafe { IsWindow(hwnd(*handle)) }.as_bool());
         let discovered = enumerate_manageable_windows()
@@ -554,7 +554,7 @@ impl Manager {
         let removed = self.windows.keys().copied()
             .filter(|handle| {
                 !discovered_handles.contains(handle)
-                    && !unsafe { IsIconic(hwnd(*handle)) }.as_bool()
+                    && !managed_window_still_present(*handle)
             })
             .collect::<Vec<_>>();
         for handle in &removed {
@@ -3614,6 +3614,36 @@ fn enumerate_monitors() -> Vec<(isize, windows::Win32::Foundation::RECT)> {
 }
 
 #[cfg(target_os = "windows")]
+fn managed_window_still_present(handle: isize) -> bool {
+    use windows::Win32::{
+        Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute},
+        UI::WindowsAndMessaging::{IsIconic, IsWindow, IsWindowVisible},
+    };
+
+    let handle = hwnd(handle);
+    if !unsafe { IsWindow(handle) }.as_bool() {
+        return false;
+    }
+    if unsafe { IsIconic(handle) }.as_bool() {
+        return true;
+    }
+    if !unsafe { IsWindowVisible(handle) }.as_bool() {
+        return false;
+    }
+    let mut cloaked = 0_u32;
+    unsafe {
+        DwmGetWindowAttribute(
+            handle,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut _ as *mut c_void,
+            std::mem::size_of_val(&cloaked) as u32,
+        )
+    }
+    .is_err()
+        || cloaked == 0
+}
+
+#[cfg(target_os = "windows")]
 fn inspect_window(handle: windows::Win32::Foundation::HWND) -> Option<ManagedWindow> {
     use windows::Win32::{
         Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute},
@@ -3686,10 +3716,7 @@ fn inspect_window(handle: windows::Win32::Foundation::HWND) -> Option<ManagedWin
         .trim()
         .to_owned();
     let raw_process_name = window_process_name(handle).unwrap_or_else(|| "Application".into());
-    if title.is_empty()
-        || title.starts_with("Overbar")
-        || is_shell_surface_title(&title, &class_name, &raw_process_name)
-    {
+    if title.is_empty() || is_shell_surface_title(&title, &class_name, &raw_process_name) {
         return None;
     }
     let process_name = if raw_process_name.eq_ignore_ascii_case("ApplicationFrameHost.exe") {
