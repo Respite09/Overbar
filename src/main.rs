@@ -22,7 +22,7 @@ use std::{
     hash::{Hash, Hasher},
     io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, Output, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -62,12 +62,18 @@ const SEARCH_PANEL_HEIGHT: f32 = 330.0;
 const SEARCH_PANEL_OPEN_SECONDS: f32 = 0.18;
 const SEARCH_PANEL_CLOSE_SECONDS: f32 = 0.13;
 const BAR_SLIDE_SECONDS: f32 = 0.18;
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const UPDATE_API_URL: &str = "https://api.github.com/repos/Respite09/Overbar/releases/latest";
+const UPDATE_DOWNLOAD_PREFIX: &str =
+    "https://github.com/Respite09/Overbar/releases/download/";
 const TEXT_PRIMARY: Color32 = Color32::from_rgb(225, 231, 236);
 const TEXT_MUTED: Color32 = Color32::from_rgb(180, 193, 201);
 const STAT_LABEL: Color32 = Color32::from_rgba_premultiplied(127, 136, 142, 180);
 const USAGE_WARNING: Color32 = Color32::from_rgb(208, 135, 112);
 const USAGE_CRITICAL: Color32 = Color32::from_rgb(191, 97, 106);
 const DEFAULT_ACCENT: Color32 = Color32::from_rgb(105, 184, 197);
+const UPDATE_NOTICE: Color32 = Color32::from_rgb(235, 203, 92);
+const UPDATE_COMPLETE: Color32 = Color32::from_rgb(163, 190, 140);
 const BAR_FONT_SIZE: f32 = 11.0;
 
 fn pill_background() -> Color32 {
@@ -196,6 +202,54 @@ struct WorkspacesState {
     items: Vec<WorkspaceEntry>,
     active: usize,
     apps: Vec<AppEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+    size: u64,
+    #[serde(default)]
+    digest: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    html_url: String,
+    assets: Vec<GithubReleaseAsset>,
+}
+
+#[derive(Clone, Debug)]
+struct AvailableUpdate {
+    version: String,
+    download_url: String,
+    size: u64,
+    digest: Option<String>,
+    release_url: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CompletedUpdate {
+    version: String,
+    release_url: String,
+}
+
+enum UpdateRequest {
+    Install(AvailableUpdate),
+}
+
+enum UpdateEvent {
+    CheckFinished(Result<Option<AvailableUpdate>, String>),
+    ReadyToRestart,
+    InstallFailed(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpdateNotice {
+    Available,
+    Failed,
+    Complete,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -495,6 +549,16 @@ struct OverbarApp {
     startup_task_updates: Receiver<Result<PathBuf, String>>,
     startup_task_in_progress: bool,
     startup_task_status: Option<(bool, String)>,
+    update_requests: Sender<UpdateRequest>,
+    update_events: Receiver<UpdateEvent>,
+    available_update: Option<AvailableUpdate>,
+    completed_update: Option<CompletedUpdate>,
+    update_in_progress: bool,
+    update_error: Option<String>,
+    update_error_copied_at: Option<Instant>,
+    update_notice: Option<UpdateNotice>,
+    update_notice_seen_in_menu: bool,
+    completed_update_seen_in_menu: bool,
     settings_icon: TextureHandle,
     app_icons: HashMap<isize, TextureHandle>,
     panel_tab: PanelTab,
@@ -585,6 +649,13 @@ impl OverbarApp {
         let wm_config = load_wm_config();
         let (startup_task_requests, startup_task_updates) =
             spawn_startup_task_worker(cc.egui_ctx.clone());
+        let (update_requests, update_events) = spawn_update_worker(cc.egui_ctx.clone());
+        let completed_update = load_completed_update();
+        // The handoff marker is single-use: completion is surfaced only by
+        // the first process launched after that update, never a later run.
+        // Invalid/mismatched markers are consumed too, so an older binary can
+        // never show both "Update Complete" and "Update Available".
+        clear_completed_update_marker();
         let (window_manager_commands, window_manager_updates, runtime_running) =
             window_manager::spawn(cc.egui_ctx.clone(), wm_config.clone());
         let title_updates = spawn_title_worker(
@@ -761,6 +832,18 @@ impl OverbarApp {
             startup_task_updates,
             startup_task_in_progress: false,
             startup_task_status: None,
+            update_requests,
+            update_events,
+            available_update: None,
+            update_notice: completed_update
+                .as_ref()
+                .map(|_| UpdateNotice::Complete),
+            completed_update,
+            update_in_progress: false,
+            update_error: None,
+            update_error_copied_at: None,
+            update_notice_seen_in_menu: false,
+            completed_update_seen_in_menu: false,
             settings_icon,
             app_icons: HashMap::new(),
             panel_tab: PanelTab::Stats,
@@ -1820,6 +1903,17 @@ impl OverbarApp {
                 );
             }
         }
+        if let Some(notice) = self.update_notice.filter(|_| !self.update_in_progress) {
+            painter.circle_filled(
+                eframe::egui::pos2(icon_rect.right() - 0.5, icon_rect.top() + 0.5),
+                2.5,
+                match notice {
+                    UpdateNotice::Available => UPDATE_NOTICE,
+                    UpdateNotice::Failed => USAGE_CRITICAL,
+                    UpdateNotice::Complete => UPDATE_COMPLETE,
+                },
+            );
+        }
 
         ui.add_space(9.0);
         if self.resize_mode_active {
@@ -2855,9 +2949,13 @@ impl OverbarApp {
             .iter()
             .map(|workspace| workspace.name.clone())
             .collect::<Vec<_>>();
+        let available_update = self.available_update.clone();
+        let completed_update = self.completed_update.clone();
         let icons = self.app_icons.clone();
         let mut jump_to: Option<(Option<isize>, String)> = None;
         let mut close_window = None;
+        let mut start_update = false;
+        let mut view_changelog = None;
         ctx.show_viewport_immediate(
             ViewportId::from_hash_of("overbar-apps-panel"),
             panel_builder,
@@ -2899,7 +2997,13 @@ impl OverbarApp {
                                     );
                                 });
                                 ui.add_space(8.0);
-                                let footer_height = 32.0;
+                                let footer_height = if available_update.is_some()
+                                    || completed_update.is_some()
+                                {
+                                    44.0
+                                } else {
+                                    32.0
+                                };
                                 let footer_gap = 6.0;
                                 let scroll_height =
                                     (ui.available_height() - footer_height - footer_gap).max(1.0);
@@ -3109,7 +3213,7 @@ impl OverbarApp {
                                 let settings_rect = eframe::egui::Rect::from_center_size(
                                     eframe::egui::pos2(
                                         footer_rect.left() + 16.0,
-                                        footer_rect.center().y,
+                                        footer_rect.bottom() - 16.0,
                                     ),
                                     Vec2::splat(24.0),
                                 );
@@ -3137,16 +3241,182 @@ impl OverbarApp {
                                     ),
                                     settings_tint,
                                 );
+                                let update_error = self.update_error.clone();
+                                let copied_feedback = self
+                                    .update_error_copied_at
+                                    .is_some_and(|copied_at| {
+                                        copied_at.elapsed() < Duration::from_millis(1500)
+                                    });
+                                if copied_feedback {
+                                    ui.ctx().request_repaint_after(Duration::from_millis(50));
+                                } else {
+                                    self.update_error_copied_at = None;
+                                }
+                                let footer_status = if copied_feedback {
+                                    "Copied!".to_owned()
+                                } else {
+                                    update_error.as_ref().map_or_else(
+                                        || format!("v{}", env!("CARGO_PKG_VERSION")),
+                                        |error| {
+                                        let summary = error
+                                            .split_whitespace()
+                                            .collect::<Vec<_>>()
+                                            .join(" ");
+                                        format!("Copy · {}", ellipsize_title(&summary, 55))
+                                        },
+                                    )
+                                };
+                                let footer_status_rect = eframe::egui::Rect::from_min_max(
+                                    eframe::egui::pos2(
+                                        footer_rect.left() + 34.0,
+                                        footer_rect.bottom() - 17.0,
+                                    ),
+                                    footer_rect.right_bottom(),
+                                );
+                                let footer_status_response = ui
+                                    .interact(
+                                        footer_status_rect,
+                                        ui.id().with("copy-update-error"),
+                                        if update_error.is_some() {
+                                            Sense::click()
+                                        } else {
+                                            Sense::hover()
+                                        },
+                                    )
+                                    .on_hover_cursor(if update_error.is_some() {
+                                        CursorIcon::PointingHand
+                                    } else {
+                                        CursorIcon::Default
+                                    });
                                 ui.painter().text(
                                     eframe::egui::pos2(
                                         footer_rect.right() - 4.0,
                                         footer_rect.bottom() - 3.0,
                                     ),
                                     eframe::egui::Align2::RIGHT_BOTTOM,
-                                    format!("v{}", env!("CARGO_PKG_VERSION")),
+                                    footer_status,
                                     FontId::monospace(8.0),
-                                    STAT_LABEL,
+                                    if update_error.is_some() {
+                                        if copied_feedback {
+                                            USAGE_CRITICAL
+                                        } else if footer_status_response.hovered() {
+                                            Color32::from_rgb(225, 125, 135)
+                                        } else {
+                                            USAGE_CRITICAL
+                                        }
+                                    } else {
+                                        STAT_LABEL
+                                    },
                                 );
+                                if footer_status_response.clicked()
+                                    && let Some(error) = update_error
+                                {
+                                    ui.ctx().copy_text(error);
+                                    self.update_error_copied_at = Some(Instant::now());
+                                }
+                                if available_update.is_some() || completed_update.is_some() {
+                                    let update_rect = eframe::egui::Rect::from_min_size(
+                                        eframe::egui::pos2(
+                                            footer_rect.right() - 118.0,
+                                            footer_rect.top(),
+                                        ),
+                                        Vec2::new(114.0, 22.0),
+                                    );
+                                    let update_response = ui
+                                        .interact(
+                                            update_rect,
+                                            ui.id().with("install-overbar-update"),
+                                            if self.update_in_progress
+                                                && completed_update.is_none()
+                                            {
+                                                Sense::hover()
+                                            } else {
+                                                Sense::click()
+                                            },
+                                        )
+                                        .on_hover_cursor(if self.update_in_progress
+                                            && completed_update.is_none()
+                                        {
+                                            CursorIcon::Default
+                                        } else {
+                                            CursorIcon::PointingHand
+                                        });
+                                    let update_text = if completed_update.is_some() {
+                                        if update_response.hovered() {
+                                            "View Changelog".to_owned()
+                                        } else {
+                                            "Update Complete!".to_owned()
+                                        }
+                                    } else if self.update_in_progress {
+                                        "Updating...".to_owned()
+                                    } else if self.update_error.is_some() {
+                                        "Retry Update?".to_owned()
+                                    } else {
+                                        "Update Available!".to_owned()
+                                    };
+                                    let update_text_color = if completed_update.is_some() {
+                                        if update_response.hovered() {
+                                            Color32::from_rgb(196, 218, 177)
+                                        } else {
+                                            UPDATE_COMPLETE
+                                        }
+                                    } else if self.update_in_progress {
+                                        TEXT_MUTED
+                                    } else if self.update_error.is_some() {
+                                        if update_response.hovered() {
+                                            Color32::from_rgb(225, 125, 135)
+                                        } else {
+                                            USAGE_CRITICAL
+                                        }
+                                    } else if update_response.hovered() {
+                                        Color32::from_rgb(250, 226, 132)
+                                    } else {
+                                        UPDATE_NOTICE
+                                    };
+                                    let update_font = FontId::monospace(9.0);
+                                    let update_text_width = ui
+                                        .painter()
+                                        .layout_no_wrap(
+                                            update_text.clone(),
+                                            update_font.clone(),
+                                            update_text_color,
+                                        )
+                                        .size()
+                                        .x;
+                                    ui.painter().text(
+                                        update_rect.right_center(),
+                                        eframe::egui::Align2::RIGHT_CENTER,
+                                        update_text,
+                                        update_font,
+                                        update_text_color,
+                                    );
+                                    if let Some(notice) = self
+                                        .update_notice
+                                        .filter(|_| !self.update_in_progress)
+                                    {
+                                        ui.painter().circle_filled(
+                                            eframe::egui::pos2(
+                                                update_rect.right()
+                                                    - update_text_width
+                                                    - 7.0,
+                                                update_rect.center().y,
+                                            ),
+                                            2.5,
+                                            match notice {
+                                                UpdateNotice::Available => UPDATE_NOTICE,
+                                                UpdateNotice::Failed => USAGE_CRITICAL,
+                                                UpdateNotice::Complete => UPDATE_COMPLETE,
+                                            },
+                                        );
+                                    }
+                                    if update_response.clicked() {
+                                        if let Some(completed) = &completed_update {
+                                            view_changelog = Some(completed.release_url.clone());
+                                        } else if !self.update_in_progress {
+                                            start_update = true;
+                                        }
+                                    }
+                                }
                                 if settings_response.clicked() {
                                     self.apps_panel_open = false;
                                     reset_windows_wm_settings_overlay();
@@ -3173,6 +3443,28 @@ impl OverbarApp {
         }
         if let Some(window_id) = close_window {
             self.close_window(&window_id);
+        }
+        if let Some(release_url) = view_changelog {
+            let _ = thread::Builder::new()
+                .name("overbar-changelog-open".into())
+                .spawn(move || open_search_path(Path::new(&release_url)));
+        }
+        if start_update {
+            self.update_error = None;
+            self.update_error_copied_at = None;
+            self.update_notice = None;
+            self.update_notice_seen_in_menu = false;
+            if let Some(update) = self.available_update.clone() {
+                if self
+                    .update_requests
+                    .send(UpdateRequest::Install(update))
+                    .is_ok()
+                {
+                    self.update_in_progress = true;
+                } else {
+                    self.update_error = Some("Update worker is unavailable".to_owned());
+                }
+            }
         }
     }
 
@@ -4669,6 +4961,54 @@ impl App for OverbarApp {
                 Err(error) => (false, error),
             });
         }
+        while let Ok(event) = self.update_events.try_recv() {
+            match event {
+                UpdateEvent::CheckFinished(Ok(update)) => {
+                    if let Some(update) = &update {
+                        record_startup_event(&format!(
+                            "update {} is available",
+                            update.version
+                        ));
+                    }
+                    let changed = match (&self.available_update, &update) {
+                        (Some(previous), Some(next)) => previous.version != next.version,
+                        (None, Some(_)) | (Some(_), None) => true,
+                        (None, None) => false,
+                    };
+                    if changed {
+                        self.update_error = None;
+                        self.update_error_copied_at = None;
+                        self.update_notice_seen_in_menu = false;
+                        self.update_notice = if self.apps_panel_open {
+                            None
+                        } else {
+                            update.as_ref().map(|_| UpdateNotice::Available)
+                        };
+                    }
+                    self.available_update = update;
+                }
+                UpdateEvent::CheckFinished(Err(error)) => {
+                    // A failed background check should never interrupt the bar.
+                    record_startup_event(&format!("update check failed: {error}"));
+                }
+                UpdateEvent::ReadyToRestart => {
+                    self.runtime_running.store(false, Ordering::Release);
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                }
+                UpdateEvent::InstallFailed(error) => {
+                    self.update_in_progress = false;
+                    self.update_error = Some(error);
+                    self.update_error_copied_at = None;
+                    self.update_notice = if self.apps_panel_open {
+                        None
+                    } else {
+                        Some(UpdateNotice::Failed)
+                    };
+                    self.update_notice_seen_in_menu = false;
+                }
+            }
+            ctx.request_repaint();
+        }
         // eframe sizes are in DPI-independent points; the monitor width supplied here is too.
         let monitor_size = ctx.input(|input| input.viewport().monitor_size);
         if let Some(monitor_size) = monitor_size {
@@ -5111,6 +5451,37 @@ impl App for OverbarApp {
             )
         {
             self.finish_search(ctx, false);
+        }
+
+        if self.apps_panel_open {
+            if self.update_notice.is_some() {
+                self.update_notice_seen_in_menu = true;
+            }
+            if self.completed_update.is_some() {
+                self.completed_update_seen_in_menu = true;
+            }
+        } else {
+            let mut notification_changed = false;
+            if self.completed_update_seen_in_menu {
+                self.completed_update_seen_in_menu = false;
+                self.completed_update = None;
+                clear_completed_update_marker();
+                if self.update_notice == Some(UpdateNotice::Complete) {
+                    self.update_notice = None;
+                    self.update_notice_seen_in_menu = false;
+                }
+                notification_changed = true;
+            }
+            if self.update_notice_seen_in_menu {
+                // Keep a badge visible for the entire first visit, then mark
+                // that independent update/failure notification as read.
+                self.update_notice_seen_in_menu = false;
+                self.update_notice = None;
+                notification_changed = true;
+            }
+            if notification_changed {
+                ctx.request_repaint();
+            }
         }
 
         ctx.request_repaint_after(if self.panel_open
@@ -6053,6 +6424,40 @@ fn wm_config_path() -> Option<PathBuf> {
         .map(|path| path.join("Overbar").join("wm-config.json"))
 }
 
+fn completed_update_path() -> Option<PathBuf> {
+    env::var_os("LOCALAPPDATA")
+        .or_else(|| env::var_os("APPDATA"))
+        .map(PathBuf::from)
+        .map(|path| path.join("Overbar").join("update-complete.json"))
+}
+
+fn load_completed_update() -> Option<CompletedUpdate> {
+    let path = completed_update_path()?;
+    let completed = serde_json::from_reader::<_, CompletedUpdate>(BufReader::new(
+        fs::File::open(path).ok()?,
+    ))
+    .ok()?;
+    if completed.version.trim().is_empty()
+        || !completed
+            .version
+            .trim()
+            .trim_start_matches(['v', 'V'])
+            .eq_ignore_ascii_case(env!("CARGO_PKG_VERSION"))
+        || !completed
+            .release_url
+            .starts_with("https://github.com/Respite09/Overbar/releases/")
+    {
+        return None;
+    }
+    Some(completed)
+}
+
+fn clear_completed_update_marker() {
+    if let Some(path) = completed_update_path() {
+        let _ = fs::remove_file(path);
+    }
+}
+
 fn load_wm_config() -> WmConfig {
     let Some(path) = wm_config_path() else { return WmConfig::default(); };
     let mut config: WmConfig = fs::File::open(path)
@@ -6078,6 +6483,439 @@ fn save_wm_config(config: &WmConfig) {
     } else {
         let _ = fs::remove_file(temporary);
     }
+}
+
+fn spawn_update_worker(ctx: Context) -> (Sender<UpdateRequest>, Receiver<UpdateEvent>) {
+    let (request_sender, request_receiver) = mpsc::channel();
+    let (event_sender, event_receiver) = mpsc::channel();
+    let _ = thread::Builder::new()
+        .name("overbar-updater".into())
+        .spawn(move || {
+            let publish_check = || {
+                let result = check_for_update();
+                let sent = event_sender
+                    .send(UpdateEvent::CheckFinished(result))
+                    .is_ok();
+                ctx.request_repaint();
+                sent
+            };
+            if !publish_check() {
+                return;
+            }
+            loop {
+                match request_receiver.recv_timeout(UPDATE_CHECK_INTERVAL) {
+                    Ok(UpdateRequest::Install(update)) => {
+                        let event = match prepare_windows_update(&update) {
+                            Ok(()) => UpdateEvent::ReadyToRestart,
+                            Err(error) => UpdateEvent::InstallFailed(error),
+                        };
+                        if event_sender.send(event).is_err() {
+                            return;
+                        }
+                        ctx.request_repaint();
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if !publish_check() {
+                            return;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            }
+        });
+    (request_sender, event_receiver)
+}
+
+#[cfg(target_os = "windows")]
+fn check_for_update() -> Result<Option<AvailableUpdate>, String> {
+    let script = format!(
+        "$ErrorActionPreference='Stop'; \
+         [Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false); \
+         $headers=@{{'User-Agent'='Overbar/{}';'Accept'='application/vnd.github+json';'X-GitHub-Api-Version'='2022-11-28'}}; \
+         Invoke-RestMethod -UseBasicParsing -TimeoutSec 15 -Headers $headers -Uri '{}' | ConvertTo-Json -Depth 5 -Compress",
+        env!("CARGO_PKG_VERSION"),
+        UPDATE_API_URL,
+    );
+    let mut command = Command::new("powershell.exe");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    hide_child_console(&mut command);
+    let output = command
+        .output()
+        .map_err(|error| format!("Could not start the update check: {error}"))?;
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if error.is_empty() {
+            format!("GitHub update check returned {}", output.status)
+        } else {
+            error
+        });
+    }
+    let response = decode_powershell_output(&output.stdout);
+    let release: GithubRelease = serde_json::from_str(response.trim_start_matches('\u{feff}'))
+        .map_err(|error| format!("GitHub returned an invalid release response: {error}"))?;
+    if !release_version_is_newer(&release.tag_name, env!("CARGO_PKG_VERSION")) {
+        return Ok(None);
+    }
+    let asset = release
+        .assets
+        .iter()
+        .find(|asset| asset.name.eq_ignore_ascii_case("overbar.exe"))
+        .or_else(|| {
+            release.assets.iter().find(|asset| {
+                asset.name.to_ascii_lowercase().contains("overbar")
+                    && asset.name.to_ascii_lowercase().ends_with(".exe")
+            })
+        })
+        .ok_or_else(|| format!("Release {} has no Overbar executable", release.tag_name))?;
+    if !asset
+        .browser_download_url
+        .starts_with(UPDATE_DOWNLOAD_PREFIX)
+    {
+        return Err("The release executable has an unexpected download location".to_owned());
+    }
+    if !release
+        .html_url
+        .starts_with("https://github.com/Respite09/Overbar/releases/")
+    {
+        return Err("The release has an unexpected changelog location".to_owned());
+    }
+    Ok(Some(AvailableUpdate {
+        version: release.tag_name.trim_start_matches(['v', 'V']).to_owned(),
+        download_url: asset.browser_download_url.clone(),
+        size: asset.size,
+        digest: asset.digest.clone(),
+        release_url: release.html_url,
+    }))
+}
+
+fn decode_powershell_output(bytes: &[u8]) -> String {
+    if bytes.starts_with(&[0xff, 0xfe]) {
+        let wide = bytes[2..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        String::from_utf16_lossy(&wide)
+    } else if bytes.starts_with(&[0xfe, 0xff]) {
+        let wide = bytes[2..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        String::from_utf16_lossy(&wide)
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn check_for_update() -> Result<Option<AvailableUpdate>, String> {
+    Ok(None)
+}
+
+fn release_version_is_newer(latest: &str, current: &str) -> bool {
+    fn parts(version: &str) -> Option<(Vec<u64>, bool)> {
+        let without_build = version
+            .trim()
+            .trim_start_matches(['v', 'V'])
+            .split('+')
+            .next()?;
+        let (core, prerelease) = without_build
+            .split_once('-')
+            .map_or((without_build, false), |(core, _)| (core, true));
+        let values = core
+            .split('.')
+            .map(str::parse::<u64>)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        (!values.is_empty()).then_some((values, prerelease))
+    }
+    let (Some((latest, latest_prerelease)), Some((current, current_prerelease))) =
+        (parts(latest), parts(current))
+    else {
+        return false;
+    };
+    let count = latest.len().max(current.len());
+    (0..count)
+        .map(|index| {
+            (
+                latest.get(index).copied().unwrap_or(0),
+                current.get(index).copied().unwrap_or(0),
+            )
+        })
+        .find(|(latest, current)| latest != current)
+        .map_or(current_prerelease && !latest_prerelease, |(latest, current)| {
+            latest > current
+        })
+}
+
+#[cfg(target_os = "windows")]
+fn prepare_windows_update(update: &AvailableUpdate) -> Result<(), String> {
+    let current = env::current_exe()
+        .map_err(|error| format!("Could not locate the running executable: {error}"))?;
+    let current = windows_powershell_path(&fs::canonicalize(&current).unwrap_or(current));
+    let directory = current
+        .parent()
+        .ok_or_else(|| "The Overbar executable has no parent directory".to_owned())?;
+    let process_id = std::process::id();
+    let downloaded = directory.join(format!(".overbar-update-{process_id}.exe"));
+    let helper = directory.join(format!(".overbar-updater-{process_id}.ps1"));
+    if downloaded.exists() {
+        fs::remove_file(&downloaded)
+            .map_err(|error| format!("Could not clear the previous update: {error}"))?;
+    }
+
+    let download_script = concat!(
+        "$ErrorActionPreference='Stop'; ",
+        "$ProgressPreference='SilentlyContinue'; ",
+        "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; ",
+        "$headers=@{'User-Agent'='Overbar-Updater';'Accept'='application/octet-stream'}; ",
+        "$destination=[Management.Automation.WildcardPattern]::Escape($env:OVERBAR_UPDATE_DESTINATION); ",
+        "Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 -Headers $headers -Uri $env:OVERBAR_UPDATE_URL -OutFile $destination"
+    );
+    let mut download = Command::new("powershell.exe");
+    download.args(["-NoProfile", "-NonInteractive", "-Command", download_script]);
+    download.env("OVERBAR_UPDATE_URL", &update.download_url);
+    download.env("OVERBAR_UPDATE_DESTINATION", &downloaded);
+    download.stdout(Stdio::null()).stderr(Stdio::piped());
+    hide_child_console(&mut download);
+    let output = download
+        .output()
+        .map_err(|error| format!("Could not start the update download: {error}"))?;
+    if !output.status.success() {
+        let _ = fs::remove_file(&downloaded);
+        let error = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if error.is_empty() {
+            format!("The update download returned {}", output.status)
+        } else {
+            error
+        });
+    }
+    let metadata = fs::metadata(&downloaded)
+        .map_err(|error| format!("Could not inspect the downloaded update: {error}"))?;
+    if update.size > 0 && metadata.len() != update.size {
+        let _ = fs::remove_file(&downloaded);
+        return Err(format!(
+            "The update download was incomplete ({} of {} bytes)",
+            metadata.len(),
+            update.size,
+        ));
+    }
+    let mut signature = [0_u8; 2];
+    fs::File::open(&downloaded)
+        .and_then(|mut file| file.read_exact(&mut signature))
+        .map_err(|error| format!("Could not validate the downloaded update: {error}"))?;
+    if signature != *b"MZ" {
+        let _ = fs::remove_file(&downloaded);
+        return Err("The downloaded release is not a Windows executable".to_owned());
+    }
+    if let Some(expected) = update
+        .digest
+        .as_deref()
+        .and_then(|digest| digest.strip_prefix("sha256:"))
+    {
+        verify_windows_sha256(&downloaded, expected)?;
+    }
+
+    let helper_script = r#"$configPath = [System.IO.Path]::ChangeExtension($PSCommandPath, 'json')
+$config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+[int]$ProcessId = $config.process_id
+[string]$Current = $config.current
+[string]$Downloaded = $config.downloaded
+[int]$RefreshStartupTask = $config.refresh_startup_task
+[string]$CompletedVersion = $config.completed_version
+[string]$ReleaseUrl = $config.release_url
+[string]$TaskName = $config.task_name
+$ErrorActionPreference = 'Stop'
+$logDirectory = Join-Path $env:LOCALAPPDATA 'Overbar'
+$logPath = Join-Path $logDirectory 'update.log'
+$completionPath = Join-Path $logDirectory 'update-complete.json'
+New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+function Write-UpdateLog([string]$Message) {
+    Add-Content -LiteralPath $logPath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $Message"
+}
+$backup = "$Current.old-$ProcessId"
+$replaced = $false
+try {
+    Wait-Process -Id $ProcessId -Timeout 60 -ErrorAction SilentlyContinue
+    for ($attempt = 0; $attempt -lt 50; $attempt++) {
+        try {
+            if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Force }
+            try {
+                [System.IO.File]::Replace($Downloaded, $Current, $backup, $true)
+            } catch {
+                Move-Item -LiteralPath $Current -Destination $backup -Force
+                try {
+                    Move-Item -LiteralPath $Downloaded -Destination $Current -Force
+                } catch {
+                    if ((Test-Path -LiteralPath $backup) -and -not (Test-Path -LiteralPath $Current)) {
+                        Move-Item -LiteralPath $backup -Destination $Current -Force
+                    }
+                    throw
+                }
+            }
+            $replaced = $true
+            break
+        } catch {
+            Start-Sleep -Milliseconds 200
+        }
+    }
+    if (-not $replaced) { throw 'Timed out while replacing the running executable.' }
+    if ($RefreshStartupTask -eq 1) {
+        $taskAction = '"' + $Current + '" --overbar-elevated'
+        & schtasks.exe /Create /TN 'Overbar Startup' /TR $taskAction /SC ONLOGON /RL HIGHEST /IT /F | Out-Null
+        if ($LASTEXITCODE -ne 0) { Write-UpdateLog 'Warning: the startup task could not be refreshed.' }
+    }
+    $completion = [ordered]@{ version = $CompletedVersion; release_url = $ReleaseUrl } | ConvertTo-Json -Compress
+    [System.IO.File]::WriteAllText($completionPath, $completion, (New-Object System.Text.UTF8Encoding($false)))
+    $launched = Start-Process -FilePath $Current -ArgumentList '--overbar-elevated' -WorkingDirectory (Split-Path -Parent $Current) -PassThru
+    if ($launched.WaitForExit(750)) {
+        throw "Updated Overbar exited immediately with code $($launched.ExitCode)."
+    }
+    if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Force }
+    Write-UpdateLog 'Update installed and Overbar restarted.'
+} catch {
+    Write-UpdateLog "Update failed: $($_.Exception.Message)"
+    if (Test-Path -LiteralPath $completionPath) {
+        Remove-Item -LiteralPath $completionPath -Force -ErrorAction SilentlyContinue
+    }
+    if ($replaced -and (Test-Path -LiteralPath $backup)) {
+        try {
+            if (Test-Path -LiteralPath $Current) { Remove-Item -LiteralPath $Current -Force }
+            Move-Item -LiteralPath $backup -Destination $Current -Force
+        } catch {
+            Write-UpdateLog "Rollback failed: $($_.Exception.Message)"
+        }
+    }
+    if (Test-Path -LiteralPath $Current) {
+        Start-Process -FilePath $Current -ArgumentList '--overbar-elevated' -WorkingDirectory (Split-Path -Parent $Current) -ErrorAction SilentlyContinue
+    }
+} finally {
+    if (Test-Path -LiteralPath $Downloaded) { Remove-Item -LiteralPath $Downloaded -Force -ErrorAction SilentlyContinue }
+    if (Test-Path -LiteralPath $configPath) { Remove-Item -LiteralPath $configPath -Force -ErrorAction SilentlyContinue }
+    if ($TaskName) { & schtasks.exe /Delete /TN $TaskName /F 2>$null | Out-Null }
+    Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+}
+"#;
+    fs::write(&helper, helper_script)
+        .map_err(|error| format!("Could not create the update helper: {error}"))?;
+    let refresh_startup_task = windows_startup_task_exists();
+    let task_name = format!("Overbar Update {process_id}");
+    let config_path = helper.with_extension("json");
+    let config = serde_json::json!({
+        "process_id": process_id,
+        "current": current,
+        "downloaded": downloaded,
+        "refresh_startup_task": i32::from(refresh_startup_task),
+        "completed_version": update.version,
+        "release_url": update.release_url,
+        "task_name": task_name,
+    });
+    let config_bytes = serde_json::to_vec(&config)
+        .map_err(|error| format!("Could not prepare the update handoff: {error}"))?;
+    fs::write(&config_path, config_bytes)
+        .map_err(|error| format!("Could not create the update handoff: {error}"))?;
+
+    let task_action = format!(
+        "powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File \"{}\"",
+        helper.display()
+    );
+    let run_schtasks = |arguments: &[&str]| -> Result<Output, String> {
+        let mut command = Command::new("schtasks.exe");
+        command.args(arguments);
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        hide_child_console(&mut command);
+        command
+            .output()
+            .map_err(|error| format!("Could not start Task Scheduler: {error}"))
+    };
+    let create = run_schtasks(&[
+        "/Create",
+        "/TN",
+        &task_name,
+        "/TR",
+        &task_action,
+        "/SC",
+        "ONCE",
+        "/SD",
+        "12/31/2099",
+        "/ST",
+        "23:59",
+        "/RL",
+        "HIGHEST",
+        "/IT",
+        "/F",
+    ])?;
+    if !create.status.success() {
+        let _ = fs::remove_file(&config_path);
+        let _ = fs::remove_file(&helper);
+        let error = decode_powershell_output(&create.stderr).trim().to_owned();
+        return Err(if error.is_empty() {
+            format!("Could not create the update task ({})", create.status)
+        } else {
+            format!("Could not create the update task: {error}")
+        });
+    }
+    let run = run_schtasks(&["/Run", "/TN", &task_name])?;
+    if !run.status.success() {
+        let _ = run_schtasks(&["/Delete", "/TN", &task_name, "/F"]);
+        let _ = fs::remove_file(&config_path);
+        let _ = fs::remove_file(&helper);
+        let error = decode_powershell_output(&run.stderr).trim().to_owned();
+        return Err(if error.is_empty() {
+            format!("Could not run the update task ({})", run.status)
+        } else {
+            format!("Could not run the update task: {error}")
+        });
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_powershell_path(path: &Path) -> PathBuf {
+    let path = path.to_string_lossy();
+    if let Some(path) = path.strip_prefix("\\\\?\\UNC\\") {
+        PathBuf::from(format!("\\\\{path}"))
+    } else if let Some(path) = path.strip_prefix("\\\\?\\") {
+        PathBuf::from(path)
+    } else {
+        PathBuf::from(path.as_ref())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn prepare_windows_update(_update: &AvailableUpdate) -> Result<(), String> {
+    Err("Automatic updates are only available on Windows".to_owned())
+}
+
+#[cfg(target_os = "windows")]
+fn verify_windows_sha256(path: &Path, expected: &str) -> Result<(), String> {
+    let mut command = Command::new("certutil.exe");
+    command.args(["-hashfile", &path.to_string_lossy(), "SHA256"]);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    hide_child_console(&mut command);
+    let output = command
+        .output()
+        .map_err(|error| format!("Could not verify the update checksum: {error}"))?;
+    let actual = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| line.chars().filter(|character| !character.is_whitespace()).collect::<String>())
+        .find(|line| line.len() == 64 && line.chars().all(|character| character.is_ascii_hexdigit()))
+        .ok_or_else(|| "Windows could not calculate the update checksum".to_owned())?;
+    if actual.eq_ignore_ascii_case(expected) {
+        Ok(())
+    } else {
+        let _ = fs::remove_file(path);
+        Err("The downloaded update failed its SHA-256 verification".to_owned())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_startup_task_exists() -> bool {
+    let mut command = Command::new("schtasks.exe");
+    command.args(["/Query", "/TN", "Overbar Startup"]);
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    hide_child_console(&mut command);
+    command.status().is_ok_and(|status| status.success())
 }
 
 fn spawn_startup_task_worker(
@@ -7108,10 +7946,8 @@ fn spawn_title_worker(ctx: Context, running: Arc<AtomicBool>) -> Receiver<String
 fn is_shell_surface_title(title: &str, class_name: &str, process_name: &str) -> bool {
     let title = title.trim().to_ascii_lowercase();
     let class_name = class_name.trim().to_ascii_lowercase();
-    let process_name = process_name
-        .trim()
-        .trim_end_matches(".exe")
-        .to_ascii_lowercase();
+    let process_name = process_name.trim().to_ascii_lowercase();
+    let process_name = process_name.strip_suffix(".exe").unwrap_or(&process_name);
     let shell_class = matches!(
         class_name.as_str(),
         "progman" | "workerw" | "shell_traywnd" | "shell_secondarytraywnd"
@@ -7121,10 +7957,12 @@ fn is_shell_surface_title(title: &str, class_name: &str, process_name: &str) -> 
             | "launchertipwnd" | "tooltips_class32" | "#32768"
     );
     let shell_process = matches!(
-        process_name.as_str(),
+        process_name,
         "popuphost" | "shellexperiencehost" | "startmenuexperiencehost"
             | "searchhost" | "searchapp" | "textinputhost" | "widgets"
-            | "lockapp" | "securityhealthsystray"
+            | "lockapp" | "securityhealthsystray" | "runtimebroker"
+            | "backgroundtaskhost" | "taskhostw" | "sihost" | "ctfmon"
+            | "fontdrvhost" | "audiodg" | "searchindexer"
     );
     let shell_title = matches!(
         title.as_str(),
@@ -7132,7 +7970,35 @@ fn is_shell_surface_title(title: &str, class_name: &str, process_name: &str) -> 
             | "notification center" | "action center" | "jump list" | "jumplist"
             | "popuphost" | "windows shell experience host"
     );
-    shell_class || shell_process || (process_name == "explorer" && shell_title)
+    shell_class
+        || shell_process
+        || is_background_window_identity(&title, &class_name)
+        || (process_name == "explorer" && shell_title)
+}
+
+fn is_background_window_identity(title: &str, class_name: &str) -> bool {
+    let title = title.trim().to_ascii_lowercase();
+    let class_name = class_name.trim().to_ascii_lowercase();
+    let background_class = matches!(
+        class_name.as_str(),
+        "olemainthreadwndclass" | "cicerouiwndframe" | "msctfime ui" | "ime"
+            | "default ime" | "chrome_messagewindow" | "chrome_systemmessagewindow"
+            | "mozillahiddenwindowclass" | "mozillataskbarpreviewclass"
+            | "qtrayiconmessagewindow" | "systemresourcenotifywindow"
+            | "mediacontextnotificationwindow" | "dde server window"
+    ) || class_name.contains("broadcastwindow")
+        || class_name.contains("hiddenwindow")
+        || class_name.contains("messagewindow")
+        || class_name.contains("trayicon")
+        || class_name.contains("taskbarpreview");
+    let background_title = matches!(
+        title.as_str(),
+        "default ime" | "msctfime ui" | "dde server window" | "olemainthreadwndname"
+            | "systemresourcenotifywindow" | "mediacontextnotificationwindow"
+    ) || title.starts_with(".net-broadcasteventwindow")
+        || title.starts_with("gdi+ window")
+        || title.starts_with("visualstudiobroadcastwindow");
+    background_class || background_title
 }
 
 fn is_transient_title_class(class_name: &str) -> bool {
@@ -7150,7 +8016,8 @@ fn is_transient_title_surface(
     class_name: &str,
 ) -> bool {
     use windows::Win32::UI::WindowsAndMessaging::{
-        GWL_EXSTYLE, GWL_STYLE, GetWindowLongW, WS_CAPTION, WS_EX_TOOLWINDOW, WS_POPUP,
+        GWL_EXSTYLE, GWL_STYLE, GW_OWNER, GetWindow, GetWindowLongW, GetWindowRect, WS_CAPTION,
+        WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_THICKFRAME,
     };
 
     if is_transient_title_class(class_name) {
@@ -7158,9 +8025,28 @@ fn is_transient_title_surface(
     }
     let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32;
     let ex_style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
-    style & WS_POPUP.0 != 0
+    if ex_style & WS_EX_NOACTIVATE.0 != 0 {
+        return true;
+    }
+    if style & WS_POPUP.0 != 0
         && style & WS_CAPTION.0 == 0
         && ex_style & WS_EX_TOOLWINDOW.0 != 0
+    {
+        return true;
+    }
+    let owner = unsafe { GetWindow(hwnd, GW_OWNER) }
+        .ok()
+        .is_some_and(|owner| !owner.is_invalid());
+    if owner
+        || ex_style & WS_EX_APPWINDOW.0 != 0
+        || style & (WS_CAPTION.0 | WS_THICKFRAME.0) != 0
+    {
+        return false;
+    }
+    let mut rect = windows::Win32::Foundation::RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut rect) }.is_err()
+        || rect.right - rect.left < 320
+        || rect.bottom - rect.top < 200
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -8239,6 +9125,40 @@ mod tests {
     }
 
     #[test]
+    fn release_versions_are_compared_numerically() {
+        assert!(release_version_is_newer("v1.2.0", "1.1.9"));
+        assert!(release_version_is_newer("2.0", "1.99.99"));
+        assert!(!release_version_is_newer("v1.1.1", "1.1.1"));
+        assert!(!release_version_is_newer("v1.1.0", "1.1.1"));
+        assert!(release_version_is_newer("v1.1.1", "1.1.1-beta.1"));
+        assert!(!release_version_is_newer("latest", "1.1.1"));
+        assert_eq!(
+            decode_powershell_output(&[0xff, 0xfe, b'{', 0, b'}', 0]),
+            "{}"
+        );
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(
+                windows_powershell_path(Path::new(
+                    r"\\?\C:\Users\respite\Documents\Overbar\overbar.exe"
+                )),
+                PathBuf::from(r"C:\Users\respite\Documents\Overbar\overbar.exe")
+            );
+            assert_eq!(
+                windows_powershell_path(Path::new(r"\\?\UNC\server\share\overbar.exe")),
+                PathBuf::from(r"\\server\share\overbar.exe")
+            );
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires access to the GitHub Releases API"]
+    fn live_github_release_response_is_compatible() {
+        assert!(check_for_update().is_ok());
+    }
+
+    #[test]
     fn shell_surfaces_use_the_search_fallback() {
         assert!(is_shell_surface_title("Program Manager", "Progman", "explorer.exe"));
         assert!(is_shell_surface_title(
@@ -8282,6 +9202,26 @@ mod tests {
         ));
         assert!(is_transient_title_class("TrayMenuWindow"));
         assert!(!is_transient_title_class("MozillaWindowClass"));
+        assert!(is_shell_surface_title(
+            "Background task",
+            "Anything",
+            "RuntimeBroker.exe",
+        ));
+        assert!(is_shell_surface_title(
+            "Server",
+            "Chrome_MessageWindow",
+            "example.exe",
+        ));
+        assert!(is_shell_surface_title(
+            "GDI+ Window (example.exe)",
+            "Anything",
+            "example.exe",
+        ));
+        assert!(!is_shell_surface_title(
+            "Development Server - Visual Studio Code",
+            "Chrome_WidgetWin_1",
+            "Code.exe",
+        ));
     }
 
     #[test]

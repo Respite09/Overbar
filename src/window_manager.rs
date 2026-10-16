@@ -3651,7 +3651,8 @@ fn inspect_window(handle: windows::Win32::Foundation::HWND) -> Option<ManagedWin
         UI::WindowsAndMessaging::{
             GWL_EXSTYLE, GWL_STYLE, GW_OWNER, GetClassNameW, GetWindow, GetWindowLongW,
             GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
-            IsWindowVisible, WS_CHILD, WS_EX_TOOLWINDOW, WS_THICKFRAME,
+            IsWindowVisible, WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW, WS_THICKFRAME,
         },
     };
 
@@ -3668,6 +3669,12 @@ fn inspect_window(handle: windows::Win32::Foundation::HWND) -> Option<ManagedWin
     let style = unsafe { GetWindowLongW(handle, GWL_STYLE) } as u32;
     let ex_style = unsafe { GetWindowLongW(handle, GWL_EXSTYLE) } as u32;
     if style & WS_CHILD.0 != 0 {
+        return None;
+    }
+    // Message-only helpers, tray hosts, and background server windows often
+    // briefly become foreground even though they explicitly opt out of activation.
+    // They are never workspace/application windows.
+    if ex_style & WS_EX_NOACTIVATE.0 != 0 {
         return None;
     }
     let owner = unsafe { GetWindow(handle, GW_OWNER) }.ok()
@@ -3730,6 +3737,16 @@ fn inspect_window(handle: windows::Win32::Foundation::HWND) -> Option<ManagedWin
     }
     let width = original.right - original.left;
     let height = original.bottom - original.top;
+    // A small unowned top-level window with no application/caption/resizing
+    // style is normally a process's message or server HWND. Keep large
+    // borderless application windows (games and media) eligible.
+    if owner.is_none()
+        && ex_style & WS_EX_APPWINDOW.0 == 0
+        && style & (WS_CAPTION.0 | WS_THICKFRAME.0) == 0
+        && (width < 320 || height < 200)
+    {
+        return None;
+    }
     let discord_chromium_splash = process_name.to_ascii_lowercase().starts_with("discord")
         && class_name.starts_with("Chrome_WidgetWin_");
     let transient = owner.is_none()

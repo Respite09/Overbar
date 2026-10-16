@@ -60,6 +60,11 @@ The Window Manager Settings panel can create or refresh an `Overbar Startup`
 Scheduled Task that launches the current executable at sign-in with highest
 privileges, avoiding subsequent UAC prompts.
 
+Overbar checks the repository's latest GitHub Release in the background. When a
+newer version is available, the Apps icon and panel show a yellow update marker.
+The update action downloads and verifies the release executable, replaces Overbar
+in its current folder, restarts it, and refreshes an existing startup task.
+
 ## Build
 
 ```powershell
