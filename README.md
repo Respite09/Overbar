@@ -49,6 +49,10 @@ The workspace buttons and tiling-direction icon expose the same actions through 
 - Settings: `bluetooth`, `wifi`, `network`, `display`, `sound`, `apps`, `updates`, `notifications`, `storage`, `personalization`, `privacy`, `power settings`, `default apps`, `date and time`
 - Web: prefix a query with `?`, such as `? best mechanical keyboards`; a web result also appears when no local results match
 
+## Warning
+
+For those with a dedicated GPU make sure to enable discrete graphics for your entire system (do NOT just enable the GPU for Overbar in Windows graphics settings).
+
 ## Run
 
 ```powershell
