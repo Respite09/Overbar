@@ -1,4 +1,6 @@
 # Overbar
+<img width="1920" height="1199" alt="image" src="https://github.com/user-attachments/assets/79754e03-0d45-4e00-a539-34fa933e76d8" />
+
 
 A lightweight native Windows topbar and tiling window manager written in Rust.
 
@@ -46,6 +48,10 @@ The workspace buttons and tiling-direction icon expose the same actions through 
 - Folders: `downloads`, `documents`, `desktop`, `pictures`, `screenshots`, `music`, `videos`, `startup`, `temp`, `appdata`, `localappdata`, `programdata`, `windows`, `system32`, `fonts`, `recycle bin`, `all apps`
 - Settings: `bluetooth`, `wifi`, `network`, `display`, `sound`, `apps`, `updates`, `notifications`, `storage`, `personalization`, `privacy`, `power settings`, `default apps`, `date and time`
 - Web: prefix a query with `?`, such as `? best mechanical keyboards`; a web result also appears when no local results match
+
+## Warning
+
+For those with a dedicated GPU make sure to enable discrete graphics for your entire system (do NOT just enable the GPU for Overbar in Windows graphics settings).
 
 ## Run
 
