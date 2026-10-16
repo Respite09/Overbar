@@ -237,6 +237,7 @@ struct CompletedUpdate {
 
 enum UpdateRequest {
     Install(AvailableUpdate),
+    SetEnabled(bool),
 }
 
 enum UpdateEvent {
@@ -292,21 +293,17 @@ struct SearchResults {
 struct SearchEntry {
     name: String,
     path: PathBuf,
-    #[serde(default)]
+    #[serde(skip)]
     name_lower: String,
-    #[serde(default)]
-    path_lower: String,
 }
 
 impl SearchEntry {
     fn new(name: String, path: PathBuf) -> Self {
         let name_lower = name.to_ascii_lowercase();
-        let path_lower = path.to_string_lossy().to_ascii_lowercase();
         Self {
             name,
             path,
             name_lower,
-            path_lower,
         }
     }
 }
@@ -316,6 +313,13 @@ struct StoredSearchIndex {
     version: u32,
     apps: Vec<SearchEntry>,
     files: Vec<SearchEntry>,
+}
+
+#[derive(Serialize)]
+struct StoredSearchIndexRef<'a> {
+    version: u32,
+    apps: &'a [SearchEntry],
+    files: &'a [SearchEntry],
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -333,9 +337,8 @@ struct StoredSearchPreferences {
     command_selections: HashMap<String, String>,
 }
 
-const SEARCH_INDEX_VERSION: u32 = 3;
-const SEARCH_INDEX_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30);
-const SEARCH_INDEX_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const SEARCH_INDEX_VERSION: u32 = 4;
+const SEARCH_INDEX_REFRESH_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const SEARCH_PREFERENCES_VERSION: u32 = 2;
 const SEARCH_RECENT_LIMIT: usize = 15;
 
@@ -357,6 +360,10 @@ fn default_media_name_width() -> f32 {
     DEFAULT_MEDIA_NAME_WIDTH
 }
 
+fn default_update_checking() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct WmConfig {
     #[serde(default = "default_wm_keybindings")]
@@ -371,6 +378,8 @@ struct WmConfig {
     window_gap: i32,
     #[serde(default = "default_media_name_width")]
     media_name_width: f32,
+    #[serde(default = "default_update_checking")]
+    check_for_updates: bool,
 }
 
 impl Default for WmConfig {
@@ -382,6 +391,7 @@ impl Default for WmConfig {
             centered_window_types: HashSet::new(),
             window_gap: default_wm_gap(),
             media_name_width: default_media_name_width(),
+            check_for_updates: default_update_checking(),
         }
     }
 }
@@ -640,22 +650,26 @@ impl OverbarApp {
         #[cfg(target_os = "windows")]
         configure_windows_overlay(cc);
 
-        let mut system = System::new_all();
+        let mut system = System::new();
         let disks = Disks::new_with_refreshed_list();
         let networks = Networks::new_with_refreshed_list();
         // The first CPU reading establishes a baseline; later readings use its delta.
-        system.refresh_cpu_usage();
+        system.refresh_cpu_all();
+        system.refresh_memory();
 
         let wm_config = load_wm_config();
         let (startup_task_requests, startup_task_updates) =
             spawn_startup_task_worker(cc.egui_ctx.clone());
-        let (update_requests, update_events) = spawn_update_worker(cc.egui_ctx.clone());
-        let completed_update = load_completed_update();
+        let (update_requests, update_events) =
+            spawn_update_worker(cc.egui_ctx.clone(), wm_config.check_for_updates);
+        let returning_user = overbar_used_marker_path().is_some_and(|path| path.exists());
+        let completed_update = returning_user.then(load_completed_update).flatten();
         // The handoff marker is single-use: completion is surfaced only by
         // the first process launched after that update, never a later run.
         // Invalid/mismatched markers are consumed too, so an older binary can
         // never show both "Update Complete" and "Update Available".
         clear_completed_update_marker();
+        mark_overbar_used();
         let (window_manager_commands, window_manager_updates, runtime_running) =
             window_manager::spawn(cc.egui_ctx.clone(), wm_config.clone());
         let title_updates = spawn_title_worker(
@@ -907,19 +921,23 @@ impl OverbarApp {
     fn refresh_metrics(&mut self) {
         self.system.refresh_cpu_usage();
         self.system.refresh_memory();
-        self.system.refresh_processes(ProcessesToUpdate::All, true);
-        let process_ids = self
-            .system
-            .processes()
-            .keys()
-            .map(|pid| pid.as_u32())
-            .collect::<Vec<_>>();
-        self.task_end_permissions
-            .retain(|pid, _| process_ids.contains(pid));
-        for pid in process_ids {
+        let needs_process_snapshot = (self.panel_open && self.panel_tab == PanelTab::Tasks)
+            || (self.search_active && kill_command_term(&self.search_query).is_some());
+        if needs_process_snapshot {
+            self.system.refresh_processes(ProcessesToUpdate::All, true);
+            let process_ids = self
+                .system
+                .processes()
+                .keys()
+                .map(|pid| pid.as_u32())
+                .collect::<HashSet<_>>();
             self.task_end_permissions
-                .entry(pid)
-                .or_insert_with(|| process_can_terminate(pid));
+                .retain(|pid, _| process_ids.contains(pid));
+            for pid in process_ids {
+                self.task_end_permissions
+                    .entry(pid)
+                    .or_insert_with(|| process_can_terminate(pid));
+            }
         }
         self.disks.refresh();
         self.networks.refresh();
@@ -1360,6 +1378,11 @@ impl OverbarApp {
         } else {
             0.0
         };
+        if (self.search_active && elapsed < SEARCH_PANEL_OPEN_SECONDS)
+            || self.search_panel_closing
+        {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
         ctx.show_viewport_immediate(
             ViewportId::from_hash_of("overbar-search-panel"),
             panel_builder,
@@ -2239,7 +2262,7 @@ impl OverbarApp {
                     TEXT_PRIMARY,
                 );
             }
-            ui.ctx().request_repaint_after(Duration::from_millis(16));
+            ui.ctx().request_repaint_after(Duration::from_millis(33));
         } else {
             text_painter.text(
                 eframe::egui::pos2(text_rect.left(), rect.center().y - 0.5),
@@ -2281,8 +2304,12 @@ impl OverbarApp {
             );
         }
 
-        if media.playing || (self.media_icon_mix_to - icon_mix).abs() > 0.001 {
+        if (self.media_icon_mix_to - icon_mix).abs() > 0.001 {
             ui.ctx().request_repaint_after(Duration::from_millis(16));
+        } else if media.playing {
+            // The one-pixel progress line does not need to redraw the entire
+            // transparent bar at display refresh rate.
+            ui.ctx().request_repaint_after(Duration::from_millis(250));
         }
         if response.clicked() {
             let _ = self.media_commands.send(MediaCommand::TogglePlayPause);
@@ -2717,9 +2744,6 @@ impl OverbarApp {
             ViewportId::from_hash_of("overbar-power-menu"),
             panel_builder,
             |panel_ctx, _viewport_class| {
-                if panel_visible {
-                    panel_ctx.request_repaint_after(Duration::from_millis(16));
-                }
                 if panel_ctx.input(|input| input.viewport().close_requested()) {
                     close_requested = true;
                 }
@@ -2894,14 +2918,22 @@ impl OverbarApp {
         if close_requested && self.scheduled_power_action.is_none() {
             self.begin_power_panel_close();
         }
-        if panel_visible {
+        if panel_visible && animation_time < 1.0 {
             ctx.request_repaint_after(Duration::from_millis(16));
+        } else if scheduled_action_can_cancel {
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
 
     fn draw_apps_panel(&mut self, ctx: &Context, monitor_width: f32) {
         let apps = self.workspaces.apps.clone();
         if self.apps_panel_open {
+            // Drop icons for windows that are no longer tracked so closed apps
+            // don't leak textures, and so a reused window handle never shows a
+            // stale icon from a previously closed window.
+            let live_handles: HashSet<isize> =
+                apps.iter().filter_map(|app| app.window_handle).collect();
+            self.app_icons.retain(|handle, _| live_handles.contains(handle));
             for app in &apps {
                 let Some(handle) = app.window_handle else {
                     continue;
@@ -2924,6 +2956,9 @@ impl OverbarApp {
             (self.apps_panel_opened_at.elapsed().as_secs_f32() / PANEL_OPEN_SECONDS)
                 .clamp(0.0, 1.0),
         );
+        if open_progress < 1.0 {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
         let animated_height = (APPS_PANEL_HEIGHT * open_progress).max(1.0);
         let panel_x = self
             .apps_icon_rect
@@ -3500,6 +3535,7 @@ impl OverbarApp {
             .with_visible(true)
             .with_window_level(WindowLevel::AlwaysOnTop);
         let mut changed = false;
+        let mut update_setting_changed = false;
         let mut close = false;
         let mut back = false;
         ctx.show_viewport_immediate(
@@ -3678,6 +3714,52 @@ impl OverbarApp {
                                         }),
                                 );
                             }
+                            ui.add_space(14.0);
+                            ui.label(
+                                RichText::new("Updates")
+                                    .font(FontId::monospace(11.0))
+                                    .strong()
+                                    .color(self.accent_color),
+                            );
+                            ui.horizontal(|ui| {
+                                ui.set_width(400.0);
+                                ui.label(
+                                    RichText::new("Automatically check for updates")
+                                        .font(FontId::monospace(9.5))
+                                        .color(TEXT_PRIMARY),
+                                );
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    let label = if self.wm_config.check_for_updates {
+                                        "Enabled"
+                                    } else {
+                                        "Disabled"
+                                    };
+                                    if Self::draw_panel_text_button(
+                                        ui,
+                                        ui.id().with("toggle-update-checking"),
+                                        label,
+                                        62.0,
+                                        if self.wm_config.check_for_updates {
+                                            self.accent_color
+                                        } else {
+                                            TEXT_MUTED
+                                        },
+                                        TEXT_PRIMARY,
+                                    ) {
+                                        self.wm_config.check_for_updates =
+                                            !self.wm_config.check_for_updates;
+                                        update_setting_changed = true;
+                                        changed = true;
+                                    }
+                                });
+                            });
+                            ui.label(
+                                RichText::new(
+                                    "When disabled, Overbar makes no GitHub release checks.",
+                                )
+                                .font(FontId::monospace(8.5))
+                                .color(TEXT_MUTED),
+                            );
                             ui.add_space(12.0);
                             if Self::draw_panel_text_button(
                                 ui,
@@ -3701,6 +3783,19 @@ impl OverbarApp {
         if changed {
             save_wm_config(&self.wm_config);
             let _ = self.window_manager_commands.send(WindowManagerCommand::UpdateConfig(self.wm_config.clone()));
+        }
+        if update_setting_changed {
+            let enabled = self.wm_config.check_for_updates;
+            let _ = self
+                .update_requests
+                .send(UpdateRequest::SetEnabled(enabled));
+            if !enabled {
+                self.available_update = None;
+                if self.update_notice == Some(UpdateNotice::Available) {
+                    self.update_notice = None;
+                    self.update_notice_seen_in_menu = false;
+                }
+            }
         }
         if back {
             self.wm_settings_closing = true;
@@ -3839,6 +3934,9 @@ impl OverbarApp {
         let open_progress = ease_out_cubic(
             (self.panel_opened_at.elapsed().as_secs_f32() / PANEL_OPEN_SECONDS).clamp(0.0, 1.0),
         );
+        if open_progress < 1.0 {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
         let animated_height = (PANEL_HEIGHT * open_progress).max(1.0);
         let panel_pos = eframe::egui::pos2(
             (self.stats_pill_rect.right() - PANEL_WIDTH)
@@ -4964,6 +5062,15 @@ impl App for OverbarApp {
         while let Ok(event) = self.update_events.try_recv() {
             match event {
                 UpdateEvent::CheckFinished(Ok(update)) => {
+                    if !self.wm_config.check_for_updates {
+                        self.available_update = None;
+                        if self.update_notice == Some(UpdateNotice::Available) {
+                            self.update_notice = None;
+                            self.update_notice_seen_in_menu = false;
+                        }
+                        ctx.request_repaint();
+                        continue;
+                    }
                     if let Some(update) = &update {
                         record_startup_event(&format!(
                             "update {} is available",
@@ -5136,6 +5243,14 @@ impl App for OverbarApp {
                     image,
                     TextureOptions::LINEAR,
                 );
+                // Cap the icon texture cache so long sessions with many distinct
+                // search results don't accumulate GPU/CPU-side textures forever.
+                // Evicted icons are simply re-requested if they're shown again.
+                if self.search_icons.len() >= 512
+                    && let Some(oldest_key) = self.search_icons.keys().next().cloned()
+                {
+                    self.search_icons.remove(&oldest_key);
+                }
                 self.search_icons.insert(path, texture);
             } else {
                 self.search_icon_failed.insert(path);
@@ -5484,18 +5599,10 @@ impl App for OverbarApp {
             }
         }
 
-        ctx.request_repaint_after(if self.panel_open
-            || self.apps_panel_open
-            || self.power_panel_open
-            || self.power_panel_closing
-            || self.wm_settings_open
-            || self.search_active
-            || self.search_panel_closing
-        {
-            Duration::from_millis(16)
-        } else {
-            Duration::from_secs(1)
-        });
+        // Individual animations request their own short cadence. A static
+        // transparent panel should not force the full desktop surface to
+        // redraw at 60 FPS.
+        ctx.request_repaint_after(Duration::from_secs(1));
     }
 
     fn clear_color(&self, _visuals: &eframe::egui::Visuals) -> [f32; 4] {
@@ -5698,9 +5805,10 @@ fn spawn_audio_worker(
                 CoUninitialize();
                 return;
             };
+            let mut previous_state = None::<AudioState>;
 
             while running.load(Ordering::Acquire) {
-                match command_receiver.recv_timeout(Duration::from_millis(50)) {
+                match command_receiver.recv_timeout(Duration::from_millis(100)) {
                     Ok(AudioCommand::SetVolume(volume)) => {
                         let _ = endpoint.SetMasterVolumeLevelScalar(
                             volume.clamp(0.0, 1.0),
@@ -5727,10 +5835,17 @@ fn spawn_audio_worker(
                         })
                     });
                 if let Ok(state) = state {
-                    if state_sender.send(state).is_err() {
-                        break;
+                    let changed = previous_state.is_none_or(|previous| {
+                        previous.muted != state.muted
+                            || (previous.volume - state.volume).abs() >= 0.001
+                    });
+                    if changed {
+                        previous_state = Some(state);
+                        if state_sender.send(state).is_err() {
+                            break;
+                        }
+                        ctx.request_repaint();
                     }
-                    ctx.request_repaint();
                 }
             }
 
@@ -5783,9 +5898,11 @@ fn spawn_media_worker(
             let mut metadata_artist = String::new();
             let mut metadata_refreshed = Instant::now() - Duration::from_secs(10);
             let mut was_visible = false;
+            let mut previous_state = None::<MediaState>;
+            let mut last_publish = Instant::now() - Duration::from_secs(2);
 
             while running.load(Ordering::Acquire) {
-                match command_receiver.recv_timeout(Duration::from_millis(75)) {
+                match command_receiver.recv_timeout(Duration::from_millis(150)) {
                     Ok(MediaCommand::TogglePlayPause) => {
                         if let Ok(session) = manager.GetCurrentSession()
                             && let Ok(operation) = session.TryTogglePlayPauseAsync()
@@ -5845,8 +5962,21 @@ fn spawn_media_worker(
                 })()
                 .unwrap_or(None);
 
-                if state.is_some() || was_visible {
+                let state_changed = match (&previous_state, &state) {
+                    (Some(previous), Some(next)) => {
+                        previous.playing != next.playing
+                            || previous.title != next.title
+                            || previous.artist != next.artist
+                            || (previous.duration_seconds - next.duration_seconds).abs() > 0.25
+                            || last_publish.elapsed() >= Duration::from_secs(1)
+                    }
+                    (None, None) => false,
+                    _ => true,
+                };
+                if state_changed || (state.is_none() && was_visible) {
                     was_visible = state.is_some();
+                    previous_state.clone_from(&state);
+                    last_publish = Instant::now();
                     if state_sender.send(state).is_err() {
                         break;
                     }
@@ -5923,14 +6053,15 @@ fn spawn_temperature_worker(
 fn spawn_search_worker(ctx: Context) -> (Sender<SearchWorkerRequest>, Receiver<SearchResults>) {
     let (request_sender, request_receiver) = mpsc::channel::<SearchWorkerRequest>();
     let (result_sender, result_receiver) = mpsc::channel::<SearchResults>();
-    let (cache_sender, cache_receiver) = mpsc::sync_channel::<StoredSearchIndex>(1);
+    let (cache_sender, cache_receiver) =
+        mpsc::sync_channel::<(Arc<Vec<SearchEntry>>, Arc<Vec<SearchEntry>>)>(1);
     let (preferences_sender, preferences_receiver) =
         mpsc::channel::<StoredSearchPreferences>();
     let _ = thread::Builder::new()
         .name("overbar-search-cache".into())
         .spawn(move || {
-            while let Ok(index) = cache_receiver.recv() {
-                save_search_index(&index);
+            while let Ok((apps, files)) = cache_receiver.recv() {
+                save_search_index_parts(&apps, &files);
             }
         });
     let _ = thread::Builder::new()
@@ -5944,37 +6075,46 @@ fn spawn_search_worker(ctx: Context) -> (Sender<SearchWorkerRequest>, Receiver<S
         .name("overbar-search-index".into())
         .spawn(move || {
             let mut preferences = load_search_preferences();
-            let cached = load_search_index().unwrap_or(StoredSearchIndex {
+            cleanup_stale_search_index_files();
+            let cached = load_search_index();
+            let has_cached_catalog = cached
+                .as_ref()
+                .is_some_and(|index| !index.apps.is_empty() || !index.files.is_empty());
+            let cached = cached.unwrap_or(StoredSearchIndex {
                 version: SEARCH_INDEX_VERSION,
                 apps: Vec::new(),
                 files: Vec::new(),
             });
-            let mut apps = cached.apps;
-            let mut files = cached.files;
+            let mut apps = Arc::new(cached.apps);
+            let mut files = Arc::new(cached.files);
             let start_apps = discover_start_menu_apps();
-            merge_search_entries(&mut apps, start_apps.iter().cloned());
+            merge_search_entries(Arc::make_mut(&mut apps), start_apps.iter().cloned());
             let mut pinned_apps = preferences.pins.clone();
             let mut live_app_paths = apps
                 .iter()
-                .map(|app| app.path.clone())
+                .map(|app| search_path_key(&app.path))
                 .collect::<HashSet<_>>();
             let mut live_file_paths = files
                 .iter()
-                .map(|file| file.path.clone())
+                .map(|file| search_path_key(&file.path))
                 .collect::<HashSet<_>>();
 
             let mut scanned_apps = start_apps;
             let mut scanned_files = Vec::new();
             let mut scanned_app_paths = scanned_apps
                 .iter()
-                .map(|app| app.path.clone())
+                .map(|app| search_path_key(&app.path))
                 .collect::<HashSet<_>>();
             let mut scanned_file_paths = HashSet::new();
-            let mut directories = search_file_roots();
+            let mut directories = if has_cached_catalog {
+                Vec::new()
+            } else {
+                search_file_roots()
+            };
             let mut indexed_directories = directories.iter().cloned().collect::<HashSet<_>>();
-            let mut scan_active = true;
+            let mut scan_active = !has_cached_catalog;
+            let mut scan_replaces_existing = has_cached_catalog;
             let mut refresh_at = Instant::now() + SEARCH_INDEX_REFRESH_INTERVAL;
-            let mut checkpoint_at = Instant::now() + SEARCH_INDEX_CHECKPOINT_INTERVAL;
             let mut query = String::new();
             let mut query_cache = preferences.cached_queries.clone();
             let mut indexed_at_last_publish = 0_usize;
@@ -6084,7 +6224,8 @@ fn spawn_search_worker(ctx: Context) -> (Sender<SearchWorkerRequest>, Receiver<S
                                     extension.eq_ignore_ascii_case("exe")
                                         || extension.eq_ignore_ascii_case("lnk")
                                 });
-                            if is_app && scanned_app_paths.insert(path.clone())
+                            let path_key = search_path_key(&path);
+                            if is_app && scanned_app_paths.insert(path_key)
                             {
                                 let app = SearchEntry::new(
                                     path
@@ -6094,14 +6235,16 @@ fn spawn_search_worker(ctx: Context) -> (Sender<SearchWorkerRequest>, Receiver<S
                                         .into_owned(),
                                     path.clone(),
                                 );
-                                scanned_apps.push(app.clone());
-                                if live_app_paths.insert(path.clone()) {
+                                if scan_replaces_existing {
+                                    scanned_apps.push(app.clone());
+                                }
+                                if live_app_paths.insert(path_key) {
                                     invalidate_search_cache_for_entry(
                                         &mut query_cache,
                                         &mut preferences.cached_queries,
                                         &app,
                                     );
-                                    apps.push(app);
+                                    Arc::make_mut(&mut apps).push(app);
                                     apps_changed = true;
                                 }
                             }
@@ -6110,16 +6253,16 @@ fn spawn_search_worker(ctx: Context) -> (Sender<SearchWorkerRequest>, Receiver<S
                                     entry.file_name().to_string_lossy().into_owned(),
                                     path.clone(),
                                 );
-                                if scanned_file_paths.insert(path.clone()) {
+                                if scanned_file_paths.insert(path_key) && scan_replaces_existing {
                                     scanned_files.push(file.clone());
                                 }
-                                if live_file_paths.insert(path) {
+                                if live_file_paths.insert(path_key) {
                                     invalidate_search_cache_for_entry(
                                         &mut query_cache,
                                         &mut preferences.cached_queries,
                                         &file,
                                     );
-                                    files.push(file);
+                                    Arc::make_mut(&mut files).push(file);
                                 }
                             }
                         }
@@ -6186,9 +6329,13 @@ fn spawn_search_worker(ctx: Context) -> (Sender<SearchWorkerRequest>, Receiver<S
                                 ctx.request_repaint();
                                 let _ = preferences_sender.send(preferences.clone());
                             }
+                            // Indexing is background work. Briefly yield the
+                            // core even when no foreground thread is waiting,
+                            // which `yield_now` alone does not guarantee.
+                            thread::sleep(Duration::from_millis(1));
                         }
                     }
-                    thread::yield_now();
+                    thread::sleep(Duration::from_millis(2));
                     if !query.trim().is_empty()
                         && (apps_changed
                             || files.len().saturating_sub(indexed_at_last_publish) >= 400)
@@ -6209,38 +6356,27 @@ fn spawn_search_worker(ctx: Context) -> (Sender<SearchWorkerRequest>, Receiver<S
                         }
                         ctx.request_repaint();
                     }
-                    if Instant::now() >= checkpoint_at {
-                        let _ = cache_sender.try_send(StoredSearchIndex {
-                            version: SEARCH_INDEX_VERSION,
-                            apps: apps.clone(),
-                            files: files.clone(),
-                        });
-                        checkpoint_at = Instant::now() + SEARCH_INDEX_CHECKPOINT_INTERVAL;
-                    }
                 } else if scan_active {
                     // Swap atomically to the freshly reconciled catalog. This drops
                     // deleted and renamed entries while searches kept using the prior
                     // complete index throughout the scan.
-                    apps = std::mem::take(&mut scanned_apps);
-                    files = std::mem::take(&mut scanned_files);
+                    if scan_replaces_existing {
+                        apps = Arc::new(std::mem::take(&mut scanned_apps));
+                        files = Arc::new(std::mem::take(&mut scanned_files));
+                    }
                     pinned_apps = preferences.pins.clone();
-                    live_app_paths = apps.iter().map(|app| app.path.clone()).collect();
-                    live_file_paths = files.iter().map(|file| file.path.clone()).collect();
+                    live_app_paths = apps.iter().map(|app| search_path_key(&app.path)).collect();
+                    live_file_paths = files.iter().map(|file| search_path_key(&file.path)).collect();
                     reconcile_search_caches(
                         &mut query_cache,
                         &mut preferences.cached_queries,
                         &live_app_paths,
                         &live_file_paths,
                     );
-                    let _ = cache_sender.try_send(StoredSearchIndex {
-                        version: SEARCH_INDEX_VERSION,
-                        apps: apps.clone(),
-                        files: files.clone(),
-                    });
+                    let _ = cache_sender.try_send((Arc::clone(&apps), Arc::clone(&files)));
                     let _ = preferences_sender.send(preferences.clone());
                     scan_active = false;
                     refresh_at = Instant::now() + SEARCH_INDEX_REFRESH_INTERVAL;
-                    checkpoint_at = Instant::now() + SEARCH_INDEX_CHECKPOINT_INTERVAL;
                     indexed_at_last_publish = files.len();
                     if result_sender
                         .send(cached_search_catalog(
@@ -6323,7 +6459,7 @@ fn spawn_search_worker(ctx: Context) -> (Sender<SearchWorkerRequest>, Receiver<S
                             let refreshed_start_apps = discover_start_menu_apps();
                             scanned_app_paths = refreshed_start_apps
                                 .iter()
-                                .map(|app| app.path.clone())
+                                .map(|app| search_path_key(&app.path))
                                 .collect();
                             scanned_apps = refreshed_start_apps;
                             scanned_files.clear();
@@ -6331,6 +6467,7 @@ fn spawn_search_worker(ctx: Context) -> (Sender<SearchWorkerRequest>, Receiver<S
                             directories = search_file_roots();
                             indexed_directories =
                                 directories.iter().cloned().collect::<HashSet<_>>();
+                            scan_replaces_existing = true;
                             scan_active = true;
                         }
                         Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -6369,19 +6506,45 @@ fn load_search_index() -> Option<StoredSearchIndex> {
     if !(2..=SEARCH_INDEX_VERSION).contains(&index.version) {
         return None;
     }
+    let needs_compaction = index.version < SEARCH_INDEX_VERSION;
     for entry in index.apps.iter_mut().chain(index.files.iter_mut()) {
         if entry.name_lower.is_empty() {
             entry.name_lower = entry.name.to_ascii_lowercase();
         }
-        if entry.path_lower.is_empty() {
-            entry.path_lower = entry.path.to_string_lossy().to_ascii_lowercase();
-        }
     }
     index.version = SEARCH_INDEX_VERSION;
+    if needs_compaction {
+        // Older indexes persisted duplicate lower-cased paths. Rewriting once
+        // drops that data without duplicating the in-memory catalog.
+        save_search_index(&index);
+    }
     Some(index)
 }
 
+fn cleanup_stale_search_index_files() {
+    let Some(index_path) = search_index_path() else {
+        return;
+    };
+    let Some(parent) = index_path.parent() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("search-index-") && name.ends_with(".tmp") {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn save_search_index(index: &StoredSearchIndex) {
+    save_search_index_parts(&index.apps, &index.files);
+}
+
+fn save_search_index_parts(apps: &[SearchEntry], files: &[SearchEntry]) {
     let Some(path) = search_index_path() else {
         return;
     };
@@ -6395,7 +6558,12 @@ fn save_search_index(index: &StoredSearchIndex) {
     let Ok(file) = fs::File::create(&temporary) else {
         return;
     };
-    if serde_json::to_writer(BufWriter::new(file), index).is_err() {
+    let index = StoredSearchIndexRef {
+        version: SEARCH_INDEX_VERSION,
+        apps,
+        files,
+    };
+    if serde_json::to_writer(BufWriter::new(file), &index).is_err() {
         let _ = fs::remove_file(temporary);
         return;
     }
@@ -6429,6 +6597,28 @@ fn completed_update_path() -> Option<PathBuf> {
         .or_else(|| env::var_os("APPDATA"))
         .map(PathBuf::from)
         .map(|path| path.join("Overbar").join("update-complete.json"))
+}
+
+fn overbar_used_marker_path() -> Option<PathBuf> {
+    env::var_os("LOCALAPPDATA")
+        .or_else(|| env::var_os("APPDATA"))
+        .map(PathBuf::from)
+        .map(|path| path.join("Overbar").join("has-launched"))
+}
+
+fn mark_overbar_used() {
+    let Some(path) = overbar_used_marker_path() else {
+        return;
+    };
+    if path.exists() {
+        return;
+    }
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_ok() {
+        let _ = fs::write(path, env!("CARGO_PKG_VERSION").as_bytes());
+    }
 }
 
 fn load_completed_update() -> Option<CompletedUpdate> {
@@ -6485,7 +6675,10 @@ fn save_wm_config(config: &WmConfig) {
     }
 }
 
-fn spawn_update_worker(ctx: Context) -> (Sender<UpdateRequest>, Receiver<UpdateEvent>) {
+fn spawn_update_worker(
+    ctx: Context,
+    mut enabled: bool,
+) -> (Sender<UpdateRequest>, Receiver<UpdateEvent>) {
     let (request_sender, request_receiver) = mpsc::channel();
     let (event_sender, event_receiver) = mpsc::channel();
     let _ = thread::Builder::new()
@@ -6499,7 +6692,7 @@ fn spawn_update_worker(ctx: Context) -> (Sender<UpdateRequest>, Receiver<UpdateE
                 ctx.request_repaint();
                 sent
             };
-            if !publish_check() {
+            if enabled && !publish_check() {
                 return;
             }
             loop {
@@ -6514,8 +6707,15 @@ fn spawn_update_worker(ctx: Context) -> (Sender<UpdateRequest>, Receiver<UpdateE
                         }
                         ctx.request_repaint();
                     }
+                    Ok(UpdateRequest::SetEnabled(next_enabled)) => {
+                        let became_enabled = next_enabled && !enabled;
+                        enabled = next_enabled;
+                        if became_enabled && !publish_check() {
+                            return;
+                        }
+                    }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if !publish_check() {
+                        if enabled && !publish_check() {
                             return;
                         }
                     }
@@ -7006,6 +7206,29 @@ fn load_search_preferences() -> StoredSearchPreferences {
         version: SEARCH_PREFERENCES_VERSION,
         ..Default::default()
     });
+    let hydrate = |entry: &mut SearchEntry| {
+        if entry.name_lower.is_empty() {
+            entry.name_lower = entry.name.to_ascii_lowercase();
+        }
+    };
+    for entry in preferences
+        .pins
+        .iter_mut()
+        .chain(preferences.recents.iter_mut())
+    {
+        hydrate(entry);
+    }
+    for results in preferences.cached_queries.values_mut() {
+        for entry in results
+            .pins
+            .iter_mut()
+            .chain(results.recents.iter_mut())
+            .chain(results.apps.iter_mut())
+            .chain(results.files.iter_mut())
+        {
+            hydrate(entry);
+        }
+    }
     preferences.version = SEARCH_PREFERENCES_VERSION;
     preferences
 }
@@ -7528,22 +7751,39 @@ fn invalidate_search_cache_for_entry(
         }
         let matches = std::iter::once(query.as_str())
             .chain(search_aliases(query).iter().copied())
-            .any(|term| entry.name_lower.contains(term) || entry.path_lower.contains(term));
+            .any(|term| {
+                entry.name_lower.contains(term)
+                    || path_contains_ascii_case_insensitive(&entry.path, term)
+            });
         !matches
     };
     cache.retain(|query, _| retain(query));
     persistent_cache.retain(|query, _| retain(query));
 }
 
+fn path_contains_ascii_case_insensitive(path: &Path, term: &str) -> bool {
+    let path = path.to_string_lossy();
+    let needle = term.as_bytes();
+    needle.is_empty()
+        || path
+            .as_bytes()
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
 fn reconcile_search_caches(
     cache: &mut HashMap<String, SearchResults>,
     persistent_cache: &mut HashMap<String, SearchResults>,
-    app_paths: &HashSet<PathBuf>,
-    file_paths: &HashSet<PathBuf>,
+    app_paths: &HashSet<u64>,
+    file_paths: &HashSet<u64>,
 ) {
     let reconcile = |results: &mut SearchResults| {
-        results.apps.retain(|entry| app_paths.contains(&entry.path));
-        results.files.retain(|entry| file_paths.contains(&entry.path));
+        results
+            .apps
+            .retain(|entry| app_paths.contains(&search_path_key(&entry.path)));
+        results
+            .files
+            .retain(|entry| file_paths.contains(&search_path_key(&entry.path)));
     };
     for results in cache.values_mut() {
         reconcile(results);
@@ -7551,6 +7791,12 @@ fn reconcile_search_caches(
     for results in persistent_cache.values_mut() {
         reconcile(results);
     }
+}
+
+fn search_path_key(path: &Path) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn search_catalog(
@@ -7582,7 +7828,6 @@ fn search_catalog(
             .iter()
             .filter_map(|entry| {
                 let name = entry.name_lower.as_str();
-                let path = entry.path_lower.as_str();
                 let score = terms
                     .iter()
                     .filter_map(|term| {
@@ -7595,7 +7840,7 @@ fn search_catalog(
                             Some(1)
                         } else if name.contains(term) {
                             Some(2)
-                        } else if path.contains(term) {
+                        } else if path_contains_ascii_case_insensitive(&entry.path, term) {
                             Some(3)
                         } else {
                             None
@@ -7863,7 +8108,7 @@ fn spawn_search_shortcut_worker(ctx: Context, running: Arc<AtomicBool>) -> Recei
                     }
                     ctx.request_repaint();
                 }
-                thread::sleep(Duration::from_millis(10));
+                thread::sleep(Duration::from_millis(25));
             }
             unsafe {
                 let _ = UnregisterHotKey(None, SEARCH_HOTKEY_ID);
@@ -7899,7 +8144,7 @@ fn spawn_title_worker(ctx: Context, running: Arc<AtomicBool>) -> Receiver<String
                     let mut process_id = 0_u32;
                     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
                     if process_id == unsafe { GetCurrentProcessId() } {
-                        thread::sleep(Duration::from_millis(40));
+                        thread::sleep(Duration::from_millis(100));
                         continue;
                     }
                     let mut class_buffer = [0_u16; 256];
@@ -7937,7 +8182,7 @@ fn spawn_title_worker(ctx: Context, running: Arc<AtomicBool>) -> Receiver<String
                         ctx.request_repaint();
                     }
                 }
-                thread::sleep(Duration::from_millis(40));
+                thread::sleep(Duration::from_millis(100));
             }
         });
     receiver
@@ -9122,6 +9367,21 @@ mod tests {
     fn long_titles_are_ellipsized() {
         assert_eq!(ellipsize_title("abcdef", 5), "abcd…");
         assert_eq!(ellipsize_title("short", 5), "short");
+    }
+
+    #[test]
+    fn search_entries_persist_without_duplicate_lowercase_strings() {
+        let entry = SearchEntry::new(
+            "Example.TXT".to_owned(),
+            PathBuf::from(r"C:\Users\Example\Example.TXT"),
+        );
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(!json.contains("name_lower"));
+        assert!(!json.contains("path_lower"));
+        assert!(path_contains_ascii_case_insensitive(
+            &entry.path,
+            r"users\example"
+        ));
     }
 
     #[test]

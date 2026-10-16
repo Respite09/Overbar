@@ -3405,10 +3405,9 @@ fn run_windows_manager(
             last_composition_refresh = Instant::now();
             ctx.request_repaint();
         }
-        if last_border_refresh.elapsed() >= Duration::from_millis(75) {
+        if force_publish || last_border_refresh.elapsed() >= Duration::from_millis(250) {
             if manager.dragging.is_none() {
                 manager.sync_native_maximize(&updates);
-                ctx.request_repaint();
             }
             manager.enforce_workspace_visibility();
             if !manager.paused && manager.dragging.is_none() {
@@ -3427,7 +3426,9 @@ fn run_windows_manager(
             }
             last_border_refresh = Instant::now();
         }
-        thread::sleep(Duration::from_millis(8));
+        // WinEvents still wake state on the next pass quickly, while avoiding
+        // a 125 Hz idle poll of every managed HWND.
+        thread::sleep(Duration::from_millis(12));
     }
 
     manager.restore_windows();
