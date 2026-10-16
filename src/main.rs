@@ -238,10 +238,14 @@ struct CompletedUpdate {
 enum UpdateRequest {
     Install(AvailableUpdate),
     SetEnabled(bool),
+    CheckNow,
 }
 
 enum UpdateEvent {
-    CheckFinished(Result<Option<AvailableUpdate>, String>),
+    CheckFinished {
+        result: Result<Option<AvailableUpdate>, String>,
+        manual: bool,
+    },
     ReadyToRestart,
     InstallFailed(String),
 }
@@ -364,6 +368,10 @@ fn default_update_checking() -> bool {
     true
 }
 
+fn default_tiling_enabled() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct WmConfig {
     #[serde(default = "default_wm_keybindings")]
@@ -380,6 +388,8 @@ struct WmConfig {
     media_name_width: f32,
     #[serde(default = "default_update_checking")]
     check_for_updates: bool,
+    #[serde(default = "default_tiling_enabled")]
+    tiling_enabled: bool,
 }
 
 impl Default for WmConfig {
@@ -392,6 +402,7 @@ impl Default for WmConfig {
             window_gap: default_wm_gap(),
             media_name_width: default_media_name_width(),
             check_for_updates: default_update_checking(),
+            tiling_enabled: default_tiling_enabled(),
         }
     }
 }
@@ -430,6 +441,7 @@ enum WindowManagerCommand {
     ToggleTilingDirection,
     ToggleFloating,
     UpdateConfig(WmConfig),
+    Shutdown(Sender<()>),
 }
 
 enum SearchAction {
@@ -564,12 +576,15 @@ struct OverbarApp {
     available_update: Option<AvailableUpdate>,
     completed_update: Option<CompletedUpdate>,
     update_in_progress: bool,
+    update_check_in_progress: bool,
+    update_check_status: Option<(bool, String)>,
     update_error: Option<String>,
     update_error_copied_at: Option<Instant>,
     update_notice: Option<UpdateNotice>,
     update_notice_seen_in_menu: bool,
     completed_update_seen_in_menu: bool,
     settings_icon: TextureHandle,
+    refresh_icon: TextureHandle,
     app_icons: HashMap<isize, TextureHandle>,
     panel_tab: PanelTab,
     task_sort: TaskSort,
@@ -749,6 +764,14 @@ impl OverbarApp {
             ),
             TextureOptions::LINEAR,
         );
+        let refresh_icon = cc.egui_ctx.load_texture(
+            "overbar-refresh-svg",
+            ColorImage::from_rgba_unmultiplied(
+                [24, 24],
+                include_bytes!("../assets/refresh.rgba"),
+            ),
+            TextureOptions::LINEAR,
+        );
         let lock_icon = cc.egui_ctx.load_texture(
             "overbar-lock-svg",
             ColorImage::from_rgba_unmultiplied([96, 96], include_bytes!("../assets/lock.rgba")),
@@ -854,11 +877,14 @@ impl OverbarApp {
                 .map(|_| UpdateNotice::Complete),
             completed_update,
             update_in_progress: false,
+            update_check_in_progress: false,
+            update_check_status: None,
             update_error: None,
             update_error_copied_at: None,
             update_notice_seen_in_menu: false,
             completed_update_seen_in_menu: false,
             settings_icon,
+            refresh_icon,
             app_icons: HashMap::new(),
             panel_tab: PanelTab::Stats,
             task_sort: TaskSort::Name,
@@ -999,6 +1025,10 @@ impl OverbarApp {
 
     fn activate_search(&mut self, ctx: &Context) {
         play_launcher_open_sound();
+        // Shell icon extraction can fail transiently while a package or
+        // shortcut target is being registered. A previous miss must not make
+        // that item iconless for the remainder of the Overbar session.
+        self.search_icon_failed.clear();
         if self.search_active {
             self.search_focus_pending = true;
             self.search_focus_attempts = 0;
@@ -2162,7 +2192,9 @@ impl OverbarApp {
         }
 
         if self.media.is_some() {
-            ui.add_space(10.0);
+            // `horizontal` already inserts normal item spacing. Compensate so
+            // this is the same physical 10 px gap as stats-to-volume.
+            ui.add_space((10.0 - ui.spacing().item_spacing.x).max(0.0));
             self.draw_media_pill(ui);
         }
     }
@@ -3579,6 +3611,45 @@ impl OverbarApp {
                             ui.add_space(5.0);
                             ui.horizontal(|ui| {
                                 ui.set_width(400.0);
+                                ui.label(
+                                    RichText::new("Tiling window manager")
+                                        .font(FontId::monospace(9.5))
+                                        .color(TEXT_PRIMARY),
+                                );
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    let label = if self.wm_config.tiling_enabled {
+                                        "Enabled"
+                                    } else {
+                                        "Disabled"
+                                    };
+                                    if Self::draw_panel_text_button(
+                                        ui,
+                                        ui.id().with("toggle-tiling-window-manager"),
+                                        label,
+                                        62.0,
+                                        if self.wm_config.tiling_enabled {
+                                            self.accent_color
+                                        } else {
+                                            TEXT_MUTED
+                                        },
+                                        TEXT_PRIMARY,
+                                    ) {
+                                        self.wm_config.tiling_enabled =
+                                            !self.wm_config.tiling_enabled;
+                                        changed = true;
+                                    }
+                                });
+                            });
+                            ui.label(
+                                RichText::new(
+                                    "Workspaces and window borders remain active when tiling is disabled.",
+                                )
+                                .font(FontId::monospace(8.5))
+                                .color(TEXT_MUTED),
+                            );
+                            ui.add_space(5.0);
+                            ui.horizontal(|ui| {
+                                ui.set_width(400.0);
                                 ui.label(RichText::new("Window gap").font(FontId::monospace(9.5)).color(TEXT_PRIMARY));
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     if Self::draw_panel_text_button(ui, ui.id().with("window-gap-plus"), "+", 24.0, TEXT_PRIMARY, self.accent_color) {
@@ -3760,6 +3831,107 @@ impl OverbarApp {
                                 .font(FontId::monospace(8.5))
                                 .color(TEXT_MUTED),
                             );
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.set_width(400.0);
+                                ui.label(
+                                    RichText::new("Check for updates now")
+                                        .font(FontId::monospace(9.5))
+                                        .color(TEXT_PRIMARY),
+                                );
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    let (rect, response) = ui.allocate_exact_size(
+                                        Vec2::splat(24.0),
+                                        if self.update_check_in_progress {
+                                            Sense::hover()
+                                        } else {
+                                            Sense::click()
+                                        },
+                                    );
+                                    let response = response
+                                        .on_hover_cursor(if self.update_check_in_progress {
+                                            CursorIcon::Default
+                                        } else {
+                                            CursorIcon::PointingHand
+                                        });
+                                    let tint = if self.update_check_in_progress {
+                                        STAT_LABEL
+                                    } else if response.hovered() {
+                                        self.accent_color
+                                    } else {
+                                        TEXT_PRIMARY
+                                    };
+                                    let angle = if self.update_check_in_progress {
+                                        ui.ctx().request_repaint_after(Duration::from_millis(16));
+                                        -(ui.input(|input| input.time) as f32
+                                            * std::f32::consts::TAU
+                                            * 0.85)
+                                            % std::f32::consts::TAU
+                                    } else {
+                                        0.0
+                                    };
+                                    let (sin, cos) = angle.sin_cos();
+                                    let rotate = |offset: Vec2| {
+                                        Vec2::new(
+                                            offset.x * cos - offset.y * sin,
+                                            offset.x * sin + offset.y * cos,
+                                        )
+                                    };
+                                    let half = 9.0;
+                                    let offsets = [
+                                        Vec2::new(-half, -half),
+                                        Vec2::new(half, -half),
+                                        Vec2::new(half, half),
+                                        Vec2::new(-half, half),
+                                    ];
+                                    let uvs = [
+                                        eframe::egui::pos2(0.0, 0.0),
+                                        eframe::egui::pos2(1.0, 0.0),
+                                        eframe::egui::pos2(1.0, 1.0),
+                                        eframe::egui::pos2(0.0, 1.0),
+                                    ];
+                                    let mut mesh = eframe::egui::epaint::Mesh::with_texture(
+                                        self.refresh_icon.id(),
+                                    );
+                                    for (offset, uv) in offsets.into_iter().zip(uvs) {
+                                        mesh.vertices.push(eframe::egui::epaint::Vertex {
+                                            pos: rect.center() + rotate(offset),
+                                            uv,
+                                            color: tint,
+                                        });
+                                    }
+                                    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+                                    ui.painter().add(eframe::egui::Shape::mesh(mesh));
+                                    if response.clicked() && !self.update_check_in_progress {
+                                        self.update_check_status = None;
+                                        if self.update_requests.send(UpdateRequest::CheckNow).is_ok() {
+                                            self.update_check_in_progress = true;
+                                        } else {
+                                            self.update_check_status = Some((
+                                                false,
+                                                "Update checker is unavailable".to_owned(),
+                                            ));
+                                        }
+                                    }
+                                });
+                            });
+                            if self.update_check_in_progress {
+                                ui.label(
+                                    RichText::new("Checking GitHub releases...")
+                                        .font(FontId::monospace(8.5))
+                                        .color(TEXT_MUTED),
+                                );
+                            } else if let Some((success, status)) = &self.update_check_status {
+                                ui.label(
+                                    RichText::new(ellipsize_title(status, 62))
+                                        .font(FontId::monospace(8.5))
+                                        .color(if *success {
+                                            self.accent_color
+                                        } else {
+                                            USAGE_CRITICAL
+                                        }),
+                                );
+                            }
                             ui.add_space(12.0);
                             if Self::draw_panel_text_button(
                                 ui,
@@ -5061,8 +5233,21 @@ impl App for OverbarApp {
         }
         while let Ok(event) = self.update_events.try_recv() {
             match event {
-                UpdateEvent::CheckFinished(Ok(update)) => {
-                    if !self.wm_config.check_for_updates {
+                UpdateEvent::CheckFinished {
+                    result: Ok(update),
+                    manual,
+                } => {
+                    if manual {
+                        self.update_check_in_progress = false;
+                        self.update_check_status = Some((
+                            true,
+                            update.as_ref().map_or_else(
+                                || "Overbar is up to date".to_owned(),
+                                |update| format!("Update {} is available", update.version),
+                            ),
+                        ));
+                    }
+                    if !self.wm_config.check_for_updates && !manual {
                         self.available_update = None;
                         if self.update_notice == Some(UpdateNotice::Available) {
                             self.update_notice = None;
@@ -5086,7 +5271,7 @@ impl App for OverbarApp {
                         self.update_error = None;
                         self.update_error_copied_at = None;
                         self.update_notice_seen_in_menu = false;
-                        self.update_notice = if self.apps_panel_open {
+                        self.update_notice = if self.apps_panel_open || self.wm_settings_open {
                             None
                         } else {
                             update.as_ref().map(|_| UpdateNotice::Available)
@@ -5094,9 +5279,16 @@ impl App for OverbarApp {
                     }
                     self.available_update = update;
                 }
-                UpdateEvent::CheckFinished(Err(error)) => {
+                UpdateEvent::CheckFinished {
+                    result: Err(error),
+                    manual,
+                } => {
                     // A failed background check should never interrupt the bar.
                     record_startup_event(&format!("update check failed: {error}"));
+                    if manual {
+                        self.update_check_in_progress = false;
+                        self.update_check_status = Some((false, error));
+                    }
                 }
                 UpdateEvent::ReadyToRestart => {
                     self.runtime_running.store(false, Ordering::Release);
@@ -5612,6 +5804,16 @@ impl App for OverbarApp {
 
 impl Drop for OverbarApp {
     fn drop(&mut self) {
+        // The WM owns cloaked/off-screen windows from inactive workspaces.
+        // Wait for it to restore every HWND and taskbar tab before teardown.
+        let (restored_sender, restored_receiver) = mpsc::channel();
+        if self
+            .window_manager_commands
+            .send(WindowManagerCommand::Shutdown(restored_sender))
+            .is_ok()
+        {
+            let _ = restored_receiver.recv_timeout(Duration::from_secs(2));
+        }
         self.runtime_running.store(false, Ordering::Release);
     }
 }
@@ -6684,15 +6886,15 @@ fn spawn_update_worker(
     let _ = thread::Builder::new()
         .name("overbar-updater".into())
         .spawn(move || {
-            let publish_check = || {
+            let publish_check = |manual| {
                 let result = check_for_update();
                 let sent = event_sender
-                    .send(UpdateEvent::CheckFinished(result))
+                    .send(UpdateEvent::CheckFinished { result, manual })
                     .is_ok();
                 ctx.request_repaint();
                 sent
             };
-            if enabled && !publish_check() {
+            if enabled && !publish_check(false) {
                 return;
             }
             loop {
@@ -6710,12 +6912,17 @@ fn spawn_update_worker(
                     Ok(UpdateRequest::SetEnabled(next_enabled)) => {
                         let became_enabled = next_enabled && !enabled;
                         enabled = next_enabled;
-                        if became_enabled && !publish_check() {
+                        if became_enabled && !publish_check(false) {
+                            return;
+                        }
+                    }
+                    Ok(UpdateRequest::CheckNow) => {
+                        if !publish_check(true) {
                             return;
                         }
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if enabled && !publish_check() {
+                        if enabled && !publish_check(false) {
                             return;
                         }
                     }
@@ -7312,6 +7519,13 @@ fn spawn_search_icon_worker(
     let _ = thread::Builder::new()
         .name("overbar-search-icons".into())
         .spawn(move || {
+            #[cfg(target_os = "windows")]
+            let com_initialized = {
+                use windows::Win32::System::Com::{
+                    COINIT_APARTMENTTHREADED, CoInitializeEx,
+                };
+                unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok()
+            };
             while let Ok(path) = request_receiver.recv() {
                 let image = load_cached_search_icon(&path).or_else(|| {
                     let image = shell_icon_image(&path, 24)?;
@@ -7319,9 +7533,14 @@ fn spawn_search_icon_worker(
                     Some(image)
                 });
                 if result_sender.send((path, image)).is_err() {
-                    return;
+                    break;
                 }
                 ctx.request_repaint();
+            }
+            #[cfg(target_os = "windows")]
+            if com_initialized {
+                use windows::Win32::System::Com::CoUninitialize;
+                unsafe { CoUninitialize() };
             }
         });
     (request_sender, result_receiver)
@@ -7331,6 +7550,8 @@ fn search_icon_cache_path(path: &Path) -> Option<PathBuf> {
     use std::collections::hash_map::DefaultHasher;
 
     let mut hasher = DefaultHasher::new();
+    // Invalidate icons cached before the shell worker initialized COM.
+    "overbar-icon-cache-v2".hash(&mut hasher);
     path.to_string_lossy().to_ascii_lowercase().hash(&mut hasher);
     if let Ok(metadata) = fs::metadata(path) {
         metadata.len().hash(&mut hasher);
@@ -8208,7 +8429,9 @@ fn is_shell_surface_title(title: &str, class_name: &str, process_name: &str) -> 
             | "lockapp" | "securityhealthsystray" | "runtimebroker"
             | "backgroundtaskhost" | "taskhostw" | "sihost" | "ctfmon"
             | "fontdrvhost" | "audiodg" | "searchindexer"
-    );
+            | "omapsvcbroker" | "armouryswagent"
+    ) || process_name.ends_with("svcbroker")
+        || process_name.ends_with("swagent");
     let shell_title = matches!(
         title.as_str(),
         "program manager" | "system tray overflow window" | "task switching"
@@ -8848,6 +9071,21 @@ fn configure_windows_apps_overlay() {}
 #[cfg(target_os = "windows")]
 fn configure_windows_power_overlay() {
     configure_named_overlay("Overbar Power Menu", 6);
+    use windows::{
+        Win32::UI::WindowsAndMessaging::{
+            FindWindowW, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE,
+        },
+        core::PCWSTR,
+    };
+    let title = "Overbar Power Menu"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    if let Ok(hwnd) = unsafe { FindWindowW(None, PCWSTR(title.as_ptr())) } {
+        // The full-screen power surface is UI chrome, not capturable app/game
+        // content. This also prevents capture overlays from claiming it.
+        let _ = unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) };
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -9468,6 +9706,16 @@ mod tests {
             "RuntimeBroker.exe",
         ));
         assert!(is_shell_surface_title(
+            "OmApSvcBroker",
+            "Anything",
+            "OmApSvcBroker.exe",
+        ));
+        assert!(is_shell_surface_title(
+            "Armoury agent",
+            "Anything",
+            "ArmourySwAgent.exe",
+        ));
+        assert!(is_shell_surface_title(
             "Server",
             "Chrome_MessageWindow",
             "example.exe",
@@ -9482,6 +9730,12 @@ mod tests {
             "Chrome_WidgetWin_1",
             "Code.exe",
         ));
+    }
+
+    #[test]
+    fn older_wm_configs_keep_tiling_enabled() {
+        let config: WmConfig = serde_json::from_str("{}").unwrap();
+        assert!(config.tiling_enabled);
     }
 
     #[test]

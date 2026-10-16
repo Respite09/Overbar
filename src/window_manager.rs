@@ -625,7 +625,7 @@ impl Manager {
                 set_managed_window_transitions(handle, disable_transitions);
                 self.windows.insert(handle, window);
                 let mut workspace = self.active_workspace;
-                if !floating {
+                if !floating && self.config.tiling_enabled {
                     let original_layout = self.layouts.get(&self.active_workspace).cloned();
                     self.insert_into_layout(self.active_workspace, handle, self.focused, None, true);
                     if !self.constrain_workspace_to_minimum(self.active_workspace) {
@@ -793,19 +793,8 @@ impl Manager {
         if self.focused != focused {
             self.focused = focused;
             changed = true;
-            if let Some(handle) = focused {
-                let workspace = self
-                    .windows
-                    .get(&handle)
-                    .map_or(self.active_workspace, |window| window.workspace);
-                let direction = self
-                    .insertion_directions
-                    .get(&handle)
-                    .copied()
-                    .unwrap_or_else(|| self.automatic_direction(workspace, handle));
-                self.direction = direction;
-            }
         }
+        self.sync_direction_to_focus();
         if let Some(handle) = focused && let Some(window) = self.windows.get(&handle) {
             self.last_focused.insert(window.workspace, handle);
         }
@@ -862,6 +851,7 @@ impl Manager {
     }
 
     fn update_config(&mut self, config: WmConfig) {
+        let tiling_was_enabled = self.config.tiling_enabled;
         self.config = config;
         for window in self.windows.values() {
             let size = if self.minimum_size_ignored(&window.process_name) {
@@ -871,7 +861,29 @@ impl Manager {
             };
             self.minimum_sizes.insert(window.handle, size);
         }
-        if !self.paused { self.tile_active_workspace(); }
+        if !self.config.tiling_enabled {
+            self.layouts.clear();
+            self.pending_growth.clear();
+            self.dragging = None;
+            self.snap_target = None;
+        } else if !tiling_was_enabled {
+            self.layouts.clear();
+            let mut windows = self
+                .windows
+                .values()
+                .filter(|window| !window.floating)
+                .map(|window| (window.workspace, window.handle))
+                .collect::<Vec<_>>();
+            windows.sort_unstable();
+            for (workspace, handle) in windows {
+                self.insert_into_layout(workspace, handle, None, None, true);
+            }
+        }
+        if !self.paused && self.config.tiling_enabled {
+            self.tile_active_workspace();
+        } else {
+            self.apply_borders();
+        }
     }
 
     fn insert_into_layout(
@@ -934,6 +946,21 @@ impl Manager {
         } else {
             TilingDirection::Vertical
         }
+    }
+
+    fn sync_direction_to_focus(&mut self) {
+        let Some(handle) = self.focused else {
+            return;
+        };
+        let workspace = self
+            .windows
+            .get(&handle)
+            .map_or(self.active_workspace, |window| window.workspace);
+        self.direction = self
+            .insertion_directions
+            .get(&handle)
+            .copied()
+            .unwrap_or_else(|| self.automatic_direction(workspace, handle));
     }
 
     fn focus_workspace(&mut self, workspace: usize) {
@@ -1897,6 +1924,10 @@ impl Manager {
     }
 
     fn tile_active_workspace(&mut self) {
+        if !self.config.tiling_enabled {
+            self.apply_borders();
+            return;
+        }
         let _ = self.constrain_workspace_to_minimum(self.active_workspace);
         self.tile_workspace(self.active_workspace);
     }
@@ -2088,10 +2119,23 @@ impl Manager {
     }
 
     fn tile_workspace(&self, workspace: usize) {
-        use windows::Win32::UI::WindowsAndMessaging::{
-            BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, HWND_NOTOPMOST,
-            SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SetWindowPos,
+        use windows::Win32::{
+            Foundation::{LPARAM, WPARAM},
+            Graphics::Gdi::{
+                HRGN, RDW_ALLCHILDREN, RDW_FRAME, RDW_INVALIDATE, RDW_UPDATENOW,
+                RedrawWindow,
+            },
+            UI::WindowsAndMessaging::{
+                BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, HWND_NOTOPMOST,
+                PostMessageW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS,
+                SWP_NOOWNERZORDER, SWP_NOREDRAW, SWP_NOSENDCHANGING, SetWindowPos,
+                WM_DWMCOMPOSITIONCHANGED,
+            },
         };
+        if !self.config.tiling_enabled {
+            self.apply_borders();
+            return;
+        }
         let placements = self
             .layout_rects(workspace)
             .into_iter()
@@ -2102,7 +2146,14 @@ impl Manager {
                         && window.maximize_restore.is_none()
                 })
             })
-            .map(|(handle, rect)| (handle, window_placement_for_visible_rect(handle, rect)))
+            .map(|(handle, rect)| {
+                let placement = window_placement_for_visible_rect(handle, rect);
+                let size_changed = visible_window_rect(handle).is_some_and(|current| {
+                    (current.right - current.left) != (rect.right - rect.left)
+                        || (current.bottom - current.top) != (rect.bottom - rect.top)
+                });
+                (handle, placement, size_changed)
+            })
             .collect::<Vec<_>>();
 
         let mut applied_as_batch = false;
@@ -2110,7 +2161,17 @@ impl Manager {
             unsafe {
                 if let Ok(mut batch) = BeginDeferWindowPos(placements.len() as i32) {
                     let mut valid = true;
-                    for (handle, placement) in &placements {
+                    for (handle, placement, size_changed) in &placements {
+                        let mut flags = SWP_NOACTIVATE
+                            | SWP_NOCOPYBITS
+                            | SWP_NOOWNERZORDER
+                            | SWP_NOSENDCHANGING;
+                        if *size_changed {
+                            // Acrylic/backdrop surfaces can retain their old
+                            // extent unless DWM is told the frame geometry has
+                            // changed, even though the client received WM_SIZE.
+                            flags |= SWP_FRAMECHANGED;
+                        }
                         match DeferWindowPos(
                             batch,
                             hwnd(*handle),
@@ -2119,7 +2180,7 @@ impl Manager {
                             placement.top,
                             (placement.right - placement.left).max(64),
                             (placement.bottom - placement.top).max(64),
-                            SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING,
+                            flags,
                         ) {
                             Ok(next) => batch = next,
                             Err(_) => {
@@ -2135,24 +2196,96 @@ impl Manager {
             }
         }
         if !applied_as_batch {
-            for (handle, placement) in placements {
+            for (handle, placement, size_changed) in &placements {
                 unsafe {
+                    let mut flags = SWP_NOACTIVATE
+                        | SWP_NOCOPYBITS
+                        | SWP_NOOWNERZORDER
+                        | SWP_NOSENDCHANGING;
+                    if *size_changed {
+                        flags |= SWP_FRAMECHANGED;
+                    }
                     let _ = SetWindowPos(
-                        hwnd(handle),
+                        hwnd(*handle),
                         HWND_NOTOPMOST,
                         placement.left,
                         placement.top,
                         (placement.right - placement.left).max(64),
                         (placement.bottom - placement.top).max(64),
-                        SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING,
+                        flags,
                     );
                 }
             }
+        }
+        let mut refreshed_composition = false;
+        for (handle, placement, size_changed) in &placements {
+            if *size_changed {
+                unsafe {
+                    // A few DirectComposition clients ignore redraw and even a
+                    // repeated WM_SIZE after a root BSP branch collapses. Give
+                    // them one real intermediate size so their swapchain must
+                    // reallocate, but suppress that intermediate redraw and
+                    // immediately restore the exact layout geometry before DWM
+                    // presents another frame.
+                    let width = (placement.right - placement.left).max(64);
+                    let height = (placement.bottom - placement.top).max(64);
+                    let quiet_flags = SWP_FRAMECHANGED
+                        | SWP_NOACTIVATE
+                        | SWP_NOCOPYBITS
+                        | SWP_NOOWNERZORDER
+                        | SWP_NOREDRAW
+                        | SWP_NOSENDCHANGING;
+                    let _ = SetWindowPos(
+                        hwnd(*handle),
+                        HWND_NOTOPMOST,
+                        placement.left,
+                        placement.top,
+                        width.saturating_add(1),
+                        height.saturating_add(1),
+                        quiet_flags,
+                    );
+                    let _ = SetWindowPos(
+                        hwnd(*handle),
+                        HWND_NOTOPMOST,
+                        placement.left,
+                        placement.top,
+                        width,
+                        height,
+                        SWP_FRAMECHANGED
+                            | SWP_NOACTIVATE
+                            | SWP_NOCOPYBITS
+                            | SWP_NOOWNERZORDER
+                            | SWP_NOSENDCHANGING,
+                    );
+                    let _ = PostMessageW(
+                        hwnd(*handle),
+                        WM_DWMCOMPOSITIONCHANGED,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                    // Invalidate without erasing. This asks the application and
+                    // DWM to repaint newly exposed backdrop pixels,
+                    // avoiding both stretched acrylic and a white/black flash.
+                    let _ = RedrawWindow(
+                        hwnd(*handle),
+                        None,
+                        HRGN::default(),
+                        RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW,
+                    );
+                }
+                refreshed_composition = true;
+            }
+        }
+        if refreshed_composition {
+            flush_dwm();
         }
         self.apply_borders();
     }
 
     fn reconcile_tiled_constraints(&mut self) -> bool {
+        if !self.config.tiling_enabled {
+            return false;
+        }
         if self.workspace_area(self.active_workspace).is_none() { return false; }
         let expected = self.layout_rects(self.active_workspace);
         let single_tile = expected.len() == 1;
@@ -3158,6 +3291,7 @@ fn run_windows_manager(
     let mut last_border_refresh = Instant::now() - Duration::from_secs(1);
     let mut last_composition_refresh = Instant::now() - Duration::from_secs(1);
     let mut last_fallback_scan = Instant::now() - Duration::from_secs(1);
+    let mut shutdown_ack = None;
     WINDOW_EVENT_DIRTY.store(true, Ordering::Release);
 
     while running.load(Ordering::Acquire) {
@@ -3190,11 +3324,14 @@ fn run_windows_manager(
                     snap_preview.clear();
                 }
                 if manager.forget_window(handle) {
-                    if !manager.paused { manager.tile_active_workspace(); }
+                    if !manager.paused && manager.config.tiling_enabled {
+                        manager.tile_active_workspace();
+                    }
                     manager.focus_active_replacement();
                     force_publish = true;
                 }
             } else if event == EVENT_SYSTEM_MOVESIZESTART
+                && manager.config.tiling_enabled
                 && manager.windows.get(&handle).is_some_and(|window| !window.floating)
             {
                 manager.dragging = Some(handle);
@@ -3256,6 +3393,10 @@ fn run_windows_manager(
                     }
                     manager.update_config(config);
                     force_publish = true;
+                }
+                WindowManagerCommand::Shutdown(ack) => {
+                    shutdown_ack = Some(ack);
+                    running.store(false, Ordering::Release);
                 }
             }
         }
@@ -3360,7 +3501,7 @@ fn run_windows_manager(
                 last_fallback_scan = Instant::now();
             }
             let (changed, layout_changed) = manager.refresh();
-            if layout_changed && !manager.paused {
+            if layout_changed && !manager.paused && manager.config.tiling_enabled {
                 manager.tile_active_workspace();
             }
             if layout_changed && manager.focused.is_none() {
@@ -3369,6 +3510,10 @@ fn run_windows_manager(
             force_publish |= changed;
         }
         manager.enforce_pending_workspace_focus();
+        // Focus can change through commands, hotkeys, workspace activation,
+        // or native events. Keep the bar tied to the focused window's actual
+        // next-insertion direction regardless of which path changed it.
+        manager.sync_direction_to_focus();
         if !manager.publish(&updates, &ctx, force_publish) {
             break;
         }
@@ -3410,7 +3555,10 @@ fn run_windows_manager(
                 manager.sync_native_maximize(&updates);
             }
             manager.enforce_workspace_visibility();
-            if !manager.paused && manager.dragging.is_none() {
+            if !manager.paused
+                && manager.config.tiling_enabled
+                && manager.dragging.is_none()
+            {
                 // Firefox-family windows (including Zen) can enforce a chrome
                 // minimum after placement. Absorb that once into the split
                 // tree instead of fighting the app between two sizes forever.
@@ -3460,6 +3608,9 @@ fn run_windows_manager(
     }
     if !restore_hook.is_invalid() {
         unsafe { let _ = UnhookWinEvent(restore_hook); }
+    }
+    if let Some(ack) = shutdown_ack {
+        let _ = ack.send(());
     }
 }
 
@@ -3826,7 +3977,13 @@ fn native_accent_colorref() -> u32 {
         let red = (argb >> 16) & 0xff;
         let green = (argb >> 8) & 0xff;
         let blue = argb & 0xff;
-        red | (green << 8) | (blue << 16)
+        // DWM can briefly report zero while the accent/compositor state is
+        // changing. Never turn a focused border black for that transient.
+        if red + green + blue < 24 {
+            0x00c5_b869
+        } else {
+            red | (green << 8) | (blue << 16)
+        }
     } else {
         0x00c5_b869
     }
