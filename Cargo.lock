@@ -1568,6 +1568,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -2273,10 +2275,11 @@ dependencies = [
 
 [[package]]
 name = "overbar"
-version = "1.1.4"
+version = "1.2.0"
 dependencies = [
  "chrono",
  "eframe",
+ "image",
  "raw-window-handle",
  "serde",
  "serde_json",

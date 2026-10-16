@@ -53,6 +53,8 @@ const PANEL_GAP: f32 = 6.0;
 const PANEL_OPEN_SECONDS: f32 = 0.2;
 const POWER_PANEL_FADE_SECONDS: f32 = 0.22;
 const POWER_ACTION_DELAY_SECONDS: u32 = 3;
+const POWER_CONTROL_ALPHA: f32 = 55.0;
+const POWER_CONTROL_HOVER_ALPHA: f32 = 24.0;
 const APPS_PANEL_WIDTH: f32 = 440.0;
 const APPS_PANEL_HEIGHT: f32 = 390.0;
 const WM_SETTINGS_PANEL_HEIGHT: f32 = 520.0;
@@ -117,6 +119,16 @@ fn trigger_power_action(action: PowerAction) {
         match action {
             PowerAction::Lock => {
                 let _ = LockWorkStation();
+            }
+            PowerAction::SwitchUser => {
+                use windows::Win32::System::RemoteDesktop::{
+                    WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTSDisconnectSession,
+                };
+                let _ = WTSDisconnectSession(
+                    WTS_CURRENT_SERVER_HANDLE,
+                    WTS_CURRENT_SESSION,
+                    false,
+                );
             }
             PowerAction::Sleep => {
                 let _ = SetSuspendState(false, false, false);
@@ -505,14 +517,269 @@ enum MediaCommand {
     TogglePlayPause,
 }
 
+#[cfg(target_os = "windows")]
+fn registry_string(subkey: &str, value: &str) -> Option<String> {
+    use windows::{
+        Win32::System::Registry::{
+            HKEY_LOCAL_MACHINE, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegGetValueW,
+        },
+        core::PCWSTR,
+    };
+
+    let subkey_wide: Vec<u16> = subkey.encode_utf16().chain(Some(0)).collect();
+    let value_wide: Vec<u16> = value.encode_utf16().chain(Some(0)).collect();
+    let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ;
+    let mut byte_count = 0_u32;
+    unsafe {
+        if RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(subkey_wide.as_ptr()),
+            PCWSTR(value_wide.as_ptr()),
+            flags,
+            None,
+            None,
+            Some(&mut byte_count),
+        )
+        .is_err()
+            || byte_count < 2
+        {
+            return None;
+        }
+        let mut buffer = vec![0_u16; (byte_count as usize).div_ceil(2)];
+        if RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(subkey_wide.as_ptr()),
+            PCWSTR(value_wide.as_ptr()),
+            flags,
+            None,
+            Some(buffer.as_mut_ptr().cast()),
+            Some(&mut byte_count),
+        )
+        .is_err()
+        {
+            return None;
+        }
+        let length = buffer.iter().position(|unit| *unit == 0).unwrap_or(buffer.len());
+        Some(String::from_utf16_lossy(&buffer[..length]))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn registry_subkeys(path: &str) -> Vec<String> {
+    use windows::{
+        Win32::System::Registry::{
+            HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegEnumKeyExW, RegOpenKeyExW,
+        },
+        core::{PCWSTR, PWSTR},
+    };
+
+    let path_wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+    let mut key = HKEY::default();
+    unsafe {
+        if RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(path_wide.as_ptr()),
+            0,
+            KEY_READ,
+            &mut key,
+        )
+        .is_err()
+        {
+            return Vec::new();
+        }
+
+        let mut names = Vec::new();
+        for index in 0_u32.. {
+            let mut name = vec![0_u16; 256];
+            let mut length = name.len() as u32;
+            if RegEnumKeyExW(
+                key,
+                index,
+                PWSTR(name.as_mut_ptr()),
+                &mut length,
+                None,
+                PWSTR::null(),
+                None,
+                None,
+            )
+            .is_err()
+            {
+                break;
+            }
+            names.push(String::from_utf16_lossy(&name[..length as usize]));
+        }
+        let _ = RegCloseKey(key);
+        names
+    }
+}
+
+fn expand_windows_environment_path(path: &str) -> PathBuf {
+    let mut expanded = path.to_owned();
+    let mut cursor = 0;
+    while let Some(relative_start) = expanded[cursor..].find('%') {
+        let start = cursor + relative_start;
+        let Some(relative_end) = expanded[start + 1..].find('%') else {
+            break;
+        };
+        let end = start + 1 + relative_end;
+        let variable = &expanded[start + 1..end];
+        let Ok(value) = env::var(variable) else {
+            cursor = end + 1;
+            continue;
+        };
+        expanded.replace_range(start..=end, &value);
+        cursor = start + value.len();
+    }
+    PathBuf::from(expanded)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_power_users() -> Vec<PowerUser> {
+    const PROFILE_LIST: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList";
+    const ACCOUNT_PICTURES: &str =
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\AccountPicture\Users";
+    const EXCLUDED_USERS: &[&str] = &[
+        "all users",
+        "default",
+        "default user",
+        "defaultaccount",
+        "defaultuser0",
+        "public",
+        "wdagutilityaccount",
+    ];
+
+    let current_name = env::var("USERNAME").unwrap_or_default();
+    let users_root = env::var("SystemDrive")
+        // `PathBuf::from("C:").join("Users")` is drive-relative (`C:Users`),
+        // not the absolute `C:\Users` tree stored by ProfileList.
+        .map(|drive| PathBuf::from(format!(r"{drive}\Users")))
+        .unwrap_or_else(|_| PathBuf::from(r"C:\Users"));
+    let mut users = Vec::new();
+    let mut seen_names = HashSet::new();
+
+    for sid in registry_subkeys(PROFILE_LIST) {
+        let profile_key = format!(r"{PROFILE_LIST}\{sid}");
+        let Some(raw_profile_path) = registry_string(&profile_key, "ProfileImagePath") else {
+            continue;
+        };
+        let profile_path = expand_windows_environment_path(&raw_profile_path);
+        if !profile_path.starts_with(&users_root) {
+            continue;
+        }
+        let Some(name) = profile_path
+            .file_name()
+            .and_then(|part| part.to_str())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        if EXCLUDED_USERS
+            .iter()
+            .any(|excluded| name.eq_ignore_ascii_case(excluded))
+            || !seen_names.insert(name.to_lowercase())
+        {
+            continue;
+        }
+
+        let picture_key = format!(r"{ACCOUNT_PICTURES}\{sid}");
+        let picture = ["Image448", "Image240", "Image192", "Image96", "Image40", "Image32"]
+            .into_iter()
+            .filter_map(|value| registry_string(&picture_key, value))
+            .map(|path| expand_windows_environment_path(&path))
+            .find(|path| path.is_file())
+            .or_else(|| {
+                env::var("ProgramData")
+                    .ok()
+                    .map(PathBuf::from)
+                    .map(|root| root.join(r"Microsoft\User Account Pictures\user.png"))
+                    .filter(|path| path.is_file())
+            });
+        users.push(PowerUser {
+            key: sid,
+            name: name.to_owned(),
+            picture,
+            current: name.eq_ignore_ascii_case(&current_name),
+        });
+    }
+
+    if users.is_empty() || !users.iter().any(|user| user.current) {
+        let name = if current_name.is_empty() {
+            "User".to_owned()
+        } else {
+            current_name
+        };
+        users.insert(
+            0,
+            PowerUser {
+                key: format!("current-{name}"),
+                name,
+                picture: None,
+                current: true,
+            },
+        );
+    }
+    users.sort_by(|left, right| {
+        right
+            .current
+            .cmp(&left.current)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+    });
+    users
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_power_users() -> Vec<PowerUser> {
+    vec![PowerUser {
+        key: "current-user".to_owned(),
+        name: env::var("USER").unwrap_or_else(|_| "User".to_owned()),
+        picture: None,
+        current: true,
+    }]
+}
+
+fn profile_picture_image(path: &Path, size: u32) -> Option<ColorImage> {
+    use image::imageops::FilterType;
+
+    let image = image::open(path)
+        .ok()?
+        .resize_to_fill(size, size, FilterType::Lanczos3)
+        .to_rgba8();
+    let mut pixels = image.into_raw();
+    let radius = size as f32 / 2.0;
+    for y in 0..size {
+        for x in 0..size {
+            let distance = ((x as f32 + 0.5 - radius).powi(2)
+                + (y as f32 + 0.5 - radius).powi(2))
+            .sqrt();
+            let alpha = (radius + 0.5 - distance).clamp(0.0, 1.0);
+            let offset = ((y * size + x) * 4 + 3) as usize;
+            pixels[offset] = (pixels[offset] as f32 * alpha).round() as u8;
+        }
+    }
+    Some(ColorImage::from_rgba_unmultiplied(
+        [size as usize, size as usize],
+        &pixels,
+    ))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PowerAction {
     Lock,
+    SwitchUser,
     Sleep,
     Hibernate,
     Shutdown,
     Restart,
     SignOut,
+}
+
+#[derive(Clone, Debug)]
+struct PowerUser {
+    key: String,
+    name: String,
+    picture: Option<PathBuf>,
+    current: bool,
 }
 
 struct OverbarApp {
@@ -563,6 +830,10 @@ struct OverbarApp {
     sleep_icon: TextureHandle,
     restart_icon: TextureHandle,
     shutdown_icon: TextureHandle,
+    logout_icon: TextureHandle,
+    power_users: Vec<PowerUser>,
+    power_user_icons: HashMap<String, TextureHandle>,
+    power_user_menu_expanded: bool,
     wm_settings_open: bool,
     wm_settings_closing: bool,
     wm_settings_transition_started: Instant,
@@ -798,6 +1069,29 @@ impl OverbarApp {
             ),
             TextureOptions::LINEAR,
         );
+        let logout_icon = cc.egui_ctx.load_texture(
+            "overbar-logout-svg",
+            ColorImage::from_rgba_unmultiplied(
+                [24, 24],
+                include_bytes!("../assets/logout.rgba"),
+            ),
+            TextureOptions::LINEAR,
+        );
+        let power_users = windows_power_users();
+        let power_user_icons = power_users
+            .iter()
+            .filter_map(|user| {
+                let image = profile_picture_image(user.picture.as_deref()?, 64)?;
+                Some((
+                    user.key.clone(),
+                    cc.egui_ctx.load_texture(
+                        format!("power-user-{}", user.key),
+                        image,
+                        TextureOptions::LINEAR,
+                    ),
+                ))
+            })
+            .collect();
 
         let workspaces = WorkspacesState {
                 items: vec![WorkspaceEntry {
@@ -861,6 +1155,10 @@ impl OverbarApp {
             sleep_icon,
             restart_icon,
             shutdown_icon,
+            logout_icon,
+            power_users,
+            power_user_icons,
+            power_user_menu_expanded: false,
             wm_settings_open: false,
             wm_settings_closing: false,
             wm_settings_transition_started: Instant::now(),
@@ -2428,6 +2726,7 @@ impl OverbarApp {
                 self.power_panel_open = true;
                 self.power_panel_closing = false;
                 self.pending_power_action = None;
+                self.power_user_menu_expanded = false;
             }
             self.panel_open = false;
             self.apps_panel_open = false;
@@ -2632,6 +2931,7 @@ impl OverbarApp {
             self.power_panel_open = false;
             self.power_panel_closing = true;
             self.power_panel_opened_at = Instant::now();
+            self.power_user_menu_expanded = false;
         }
     }
 
@@ -2654,7 +2954,9 @@ impl OverbarApp {
             rect.center() - Vec2::new(0.0, 5.0 * hover),
             rect.size() * (1.0 + 0.035 * hover),
         );
-        let background_alpha = ((18.0 + 48.0 * hover) * opacity).round() as u8;
+        let background_alpha = ((POWER_CONTROL_ALPHA + POWER_CONTROL_HOVER_ALPHA * hover)
+            * opacity)
+            .round() as u8;
         ui.painter().rect_filled(
             card_rect,
             CornerRadius::same(18),
@@ -2703,6 +3005,46 @@ impl OverbarApp {
             foreground,
         );
         response.clicked()
+    }
+
+    fn draw_power_user_avatar(
+        ui: &eframe::egui::Ui,
+        rect: eframe::egui::Rect,
+        texture: Option<eframe::egui::TextureId>,
+        name: &str,
+        opacity: f32,
+    ) {
+        if let Some(texture) = texture {
+            ui.painter().image(
+                texture,
+                rect,
+                eframe::egui::Rect::from_min_max(
+                    eframe::egui::Pos2::ZERO,
+                    eframe::egui::pos2(1.0, 1.0),
+                ),
+                Color32::WHITE.gamma_multiply(opacity),
+            );
+            return;
+        }
+
+        ui.painter().circle_filled(
+            rect.center(),
+            rect.width() / 2.0,
+            Color32::from_rgba_unmultiplied(
+                118,
+                127,
+                132,
+                (175.0 * opacity).round() as u8,
+            ),
+        );
+        let initial = name.chars().next().unwrap_or('?').to_uppercase().to_string();
+        ui.painter().text(
+            rect.center(),
+            eframe::egui::Align2::CENTER_CENTER,
+            initial,
+            FontId::monospace(rect.height() * 0.46),
+            TEXT_PRIMARY.gamma_multiply(opacity),
+        );
     }
 
     fn draw_power_panel(&mut self, ctx: &Context, monitor_size: Vec2) {
@@ -2766,6 +3108,14 @@ impl OverbarApp {
         let sleep_icon = self.sleep_icon.id();
         let restart_icon = self.restart_icon.id();
         let shutdown_icon = self.shutdown_icon.id();
+        let logout_icon = self.logout_icon.id();
+        let power_users = self.power_users.clone();
+        let power_user_icons: HashMap<String, eframe::egui::TextureId> = self
+            .power_user_icons
+            .iter()
+            .map(|(key, texture)| (key.clone(), texture.id()))
+            .collect();
+        let mut power_user_menu_expanded = self.power_user_menu_expanded;
         let accent = self.accent_color;
         let scheduled_action = self.scheduled_power_action;
         let scheduled_action_can_cancel = self.scheduled_power_action_started.is_some();
@@ -2829,7 +3179,10 @@ impl OverbarApp {
                                         9,
                                         11,
                                         15,
-                                        ((38.0 + 82.0 * hover) * opacity).round() as u8,
+                                        ((POWER_CONTROL_ALPHA
+                                            + POWER_CONTROL_HOVER_ALPHA * hover)
+                                            * opacity)
+                                            .round() as u8,
                                     ),
                                 );
                                 ui.painter().text(
@@ -2866,7 +3219,10 @@ impl OverbarApp {
                                 9,
                                 11,
                                 15,
-                                ((20.0 + 50.0 * back_hover) * opacity).round() as u8,
+                                ((POWER_CONTROL_ALPHA
+                                    + POWER_CONTROL_HOVER_ALPHA * back_hover)
+                                    * opacity)
+                                    .round() as u8,
                             ),
                         );
                         ui.painter().text(
@@ -2878,6 +3234,255 @@ impl OverbarApp {
                         );
                         if back_response.clicked() {
                             close_requested = true;
+                        }
+
+                        if let Some(current_user) = power_users
+                            .iter()
+                            .find(|user| user.current)
+                            .or_else(|| power_users.first())
+                        {
+                            let other_users: Vec<&PowerUser> = power_users
+                                .iter()
+                                .filter(|user| user.key != current_user.key)
+                                .collect();
+                            let user_font = FontId::monospace(12.0);
+                            let user_name_width = ui
+                                .painter()
+                                .layout_no_wrap(
+                                    current_user.name.clone(),
+                                    user_font.clone(),
+                                    TEXT_PRIMARY,
+                                )
+                                .size()
+                                .x;
+                            // Match the avatar's left inset to the logout
+                            // glyph's 12.5-point right inset.
+                            let card_width = 12.5 + 29.0 + 10.0 + user_name_width + 9.0 + 43.0;
+                            let card_rect = eframe::egui::Rect::from_min_size(
+                                eframe::egui::pos2(
+                                    screen.right() - 24.0 - card_width,
+                                    screen.top() + 20.0,
+                                ),
+                                Vec2::new(card_width, 42.0),
+                            );
+                            let sign_out_rect = eframe::egui::Rect::from_min_max(
+                                eframe::egui::pos2(card_rect.right() - 43.0, card_rect.top()),
+                                card_rect.max,
+                            );
+                            let account_rect = eframe::egui::Rect::from_min_max(
+                                card_rect.min,
+                                eframe::egui::pos2(sign_out_rect.left(), card_rect.bottom()),
+                            );
+                            let card_id = ui.id().with("power-user-card");
+                            let account_response = ui
+                                .interact(
+                                    account_rect,
+                                    card_id,
+                                    if other_users.is_empty() {
+                                        Sense::hover()
+                                    } else {
+                                        Sense::click()
+                                    },
+                                )
+                                .on_hover_cursor(if other_users.is_empty() {
+                                    CursorIcon::Default
+                                } else {
+                                    CursorIcon::PointingHand
+                                });
+                            let sign_out_id = card_id.with("sign-out");
+                            let sign_out_response = ui
+                                .interact(sign_out_rect, sign_out_id, Sense::click())
+                                .on_hover_cursor(CursorIcon::PointingHand);
+                            let account_hover = ui.ctx().animate_bool_with_time(
+                                card_id.with("hover"),
+                                account_response.hovered(),
+                                0.16,
+                            );
+                            let sign_out_hover = ui.ctx().animate_bool_with_time(
+                                sign_out_id.with("hover"),
+                                sign_out_response.hovered(),
+                                0.16,
+                            );
+                            ui.painter().rect_filled(
+                                card_rect,
+                                CornerRadius::same(10),
+                                Color32::from_rgba_unmultiplied(
+                                    9,
+                                    11,
+                                    15,
+                                    ((POWER_CONTROL_ALPHA
+                                        + POWER_CONTROL_HOVER_ALPHA
+                                            * account_hover.max(sign_out_hover))
+                                        * opacity)
+                                        .round() as u8,
+                                ),
+                            );
+                            let avatar_rect = eframe::egui::Rect::from_center_size(
+                                eframe::egui::pos2(card_rect.left() + 27.0, card_rect.center().y),
+                                Vec2::splat(29.0),
+                            );
+                            Self::draw_power_user_avatar(
+                                ui,
+                                avatar_rect,
+                                power_user_icons.get(&current_user.key).copied(),
+                                &current_user.name,
+                                opacity,
+                            );
+                            ui.painter().text(
+                                eframe::egui::pos2(avatar_rect.right() + 10.0, card_rect.center().y),
+                                eframe::egui::Align2::LEFT_CENTER,
+                                &current_user.name,
+                                user_font,
+                                TEXT_PRIMARY.gamma_multiply(opacity),
+                            );
+                            let logout_rect = eframe::egui::Rect::from_center_size(
+                                sign_out_rect.center(),
+                                Vec2::splat(18.0 + 1.5 * sign_out_hover),
+                            );
+                            ui.painter().image(
+                                logout_icon,
+                                logout_rect,
+                                eframe::egui::Rect::from_min_max(
+                                    eframe::egui::Pos2::ZERO,
+                                    eframe::egui::pos2(1.0, 1.0),
+                                ),
+                                (if sign_out_response.hovered() {
+                                    Color32::from_rgb(235, 116, 126)
+                                } else {
+                                    USAGE_CRITICAL
+                                })
+                                .gamma_multiply(opacity),
+                            );
+                            if account_response.clicked() && !other_users.is_empty() {
+                                power_user_menu_expanded = !power_user_menu_expanded;
+                            }
+                            if sign_out_response.clicked() {
+                                action = Some(PowerAction::SignOut);
+                            }
+
+                            let menu_animation = ui.ctx().animate_bool_with_time(
+                                card_id.with("dropdown-open"),
+                                power_user_menu_expanded && !other_users.is_empty(),
+                                0.2,
+                            );
+                            let menu_progress = smootherstep(menu_animation.clamp(0.0, 1.0));
+                            if menu_progress > 0.001 && !other_users.is_empty() {
+                                const USER_MENU_WIDTH: f32 = 230.0;
+                                let full_menu_rect = eframe::egui::Rect::from_min_size(
+                                    eframe::egui::pos2(
+                                        card_rect.right() - USER_MENU_WIDTH,
+                                        card_rect.bottom() + 7.0,
+                                    ),
+                                    Vec2::new(
+                                        USER_MENU_WIDTH,
+                                        other_users.len() as f32 * 48.0 + 8.0,
+                                    ),
+                                );
+                                let menu_rect = eframe::egui::Rect::from_min_size(
+                                    full_menu_rect.min,
+                                    Vec2::new(
+                                        full_menu_rect.width(),
+                                        full_menu_rect.height() * menu_progress,
+                                    ),
+                                );
+                                let menu_opacity = opacity * menu_progress;
+                                ui.painter().rect_filled(
+                                    menu_rect,
+                                    CornerRadius::same(10),
+                                    Color32::from_rgba_unmultiplied(
+                                        9,
+                                        11,
+                                        15,
+                                        (POWER_CONTROL_ALPHA * menu_opacity).round() as u8,
+                                    ),
+                                );
+                                let previous_clip = ui.clip_rect();
+                                ui.set_clip_rect(menu_rect);
+                                for (index, user) in other_users.iter().enumerate() {
+                                    let row_rect = eframe::egui::Rect::from_min_size(
+                                        full_menu_rect.min
+                                            + Vec2::new(
+                                                4.0,
+                                                4.0 + index as f32 * 48.0
+                                                    - 6.0 * (1.0 - menu_progress),
+                                            ),
+                                        Vec2::new(full_menu_rect.width() - 8.0, 44.0),
+                                    );
+                                    let row_id = card_id.with(("other-user", &user.key));
+                                    let row_response = ui
+                                        .interact(
+                                            row_rect,
+                                            row_id,
+                                            if power_user_menu_expanded && menu_progress > 0.75 {
+                                                Sense::click()
+                                            } else {
+                                                Sense::hover()
+                                            },
+                                        )
+                                        .on_hover_cursor(CursorIcon::PointingHand);
+                                    let row_hover = ui.ctx().animate_bool_with_time(
+                                        row_id.with("hover"),
+                                        row_response.hovered(),
+                                        0.16,
+                                    );
+                                    if row_hover > 0.0 {
+                                        ui.painter().rect_filled(
+                                            row_rect,
+                                            CornerRadius::same(7),
+                                            Color32::from_rgba_unmultiplied(
+                                                9,
+                                                11,
+                                                15,
+                                                (POWER_CONTROL_HOVER_ALPHA
+                                                    * row_hover
+                                                    * menu_opacity)
+                                                    .round() as u8,
+                                            ),
+                                        );
+                                    }
+                                    let avatar_rect = eframe::egui::Rect::from_center_size(
+                                        eframe::egui::pos2(
+                                            row_rect.left() + 23.0,
+                                            row_rect.center().y,
+                                        ),
+                                        Vec2::splat(30.0),
+                                    );
+                                    Self::draw_power_user_avatar(
+                                        ui,
+                                        avatar_rect,
+                                        power_user_icons.get(&user.key).copied(),
+                                        &user.name,
+                                        menu_opacity,
+                                    );
+                                    ui.painter().text(
+                                        eframe::egui::pos2(
+                                            avatar_rect.right() + 10.0,
+                                            row_rect.center().y,
+                                        ),
+                                        eframe::egui::Align2::LEFT_CENTER,
+                                        ellipsize_title(&user.name, 22),
+                                        FontId::monospace(12.0),
+                                        (if row_response.hovered() { accent } else { TEXT_PRIMARY })
+                                            .gamma_multiply(menu_opacity),
+                                    );
+                                    if row_response.clicked() {
+                                        action = Some(PowerAction::SwitchUser);
+                                    }
+                                }
+                                ui.set_clip_rect(previous_clip);
+
+                                if power_user_menu_expanded
+                                    && ui.input(|input| input.pointer.primary_clicked())
+                                    && ui.input(|input| {
+                                        input.pointer.interact_pos().is_some_and(|position| {
+                                            !card_rect.contains(position)
+                                                && !full_menu_rect.contains(position)
+                                        })
+                                    })
+                                {
+                                    power_user_menu_expanded = false;
+                                }
+                            }
                         }
 
                         let card_width = (screen.width() * 0.12).clamp(145.0, 190.0);
@@ -2922,6 +3527,7 @@ impl OverbarApp {
                     });
             },
         );
+        self.power_user_menu_expanded = power_user_menu_expanded;
         configure_windows_power_overlay();
         if panel_visible {
             ensure_windows_overlay_topmost("Overbar Power Menu");
@@ -9082,8 +9688,7 @@ fn configure_windows_power_overlay() {
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
     if let Ok(hwnd) = unsafe { FindWindowW(None, PCWSTR(title.as_ptr())) } {
-        // The full-screen power surface is UI chrome, not capturable app/game
-        // content. This also prevents capture overlays from claiming it.
+        // The full-screen power surface is UI chrome, not capturable content.
         let _ = unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) };
     }
 }
