@@ -1972,6 +1972,9 @@ impl OverbarApp {
             },
         );
         configure_windows_search_overlay();
+        if panel_is_visible {
+            ensure_windows_overlay_topmost("Overbar Search Panel");
+        }
         self.search_scroll_to_selected = false;
 
         let result_count = self.search_result_count();
@@ -7774,9 +7777,18 @@ try {
     }
     if (-not $replaced) { throw 'Timed out while replacing the running executable.' }
     if ($RefreshStartupTask -eq 1) {
-        $taskAction = '"' + $Current + '" --overbar-elevated'
-        & schtasks.exe /Create /TN 'Overbar Startup' /TR $taskAction /SC ONLOGON /RL HIGHEST /IT /F | Out-Null
-        if ($LASTEXITCODE -ne 0) { Write-UpdateLog 'Warning: the startup task could not be refreshed.' }
+        try {
+            $taskDirectory = Split-Path -Parent $Current
+            $taskIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+            $taskAction = New-ScheduledTaskAction -Execute $Current -Argument '--overbar-elevated' -WorkingDirectory $taskDirectory
+            $taskTrigger = New-ScheduledTaskTrigger -AtLogOn -User $taskIdentity
+            $taskTrigger.Delay = 'PT3S'
+            $taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -DontStopOnIdleEnd -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+            $taskPrincipal = New-ScheduledTaskPrincipal -UserId $taskIdentity -LogonType Interactive -RunLevel Highest
+            Register-ScheduledTask -TaskName 'Overbar Startup' -Action $taskAction -Trigger $taskTrigger -Settings $taskSettings -Principal $taskPrincipal -Description 'Launch Overbar at sign-in.' -Force | Out-Null
+        } catch {
+            Write-UpdateLog "Warning: the startup task could not be refreshed: $($_.Exception.Message)"
+        }
     }
     $completion = [ordered]@{ version = $CompletedVersion; release_url = $ReleaseUrl } | ConvertTo-Json -Compress
     [System.IO.File]::WriteAllText($completionPath, $completion, (New-Object System.Text.UTF8Encoding($false)))
@@ -7958,29 +7970,36 @@ fn recreate_windows_startup_task() -> Result<PathBuf, String> {
     const TASK_NAME: &str = "Overbar Startup";
     let executable = env::current_exe()
         .map_err(|error| format!("Could not locate Overbar: {error}"))?;
-    let executable = fs::canonicalize(&executable).unwrap_or(executable);
+    let executable = windows_powershell_path(&fs::canonicalize(&executable).unwrap_or(executable));
+    let working_directory = executable
+        .parent()
+        .ok_or_else(|| "Overbar's executable has no parent directory".to_owned())?;
+    let quote = |value: &Path| {
+        format!("'{}'", value.to_string_lossy().replace('\'', "''"))
+    };
+    let executable_argument = quote(&executable);
+    let working_directory_argument = quote(working_directory);
+    let script = format!(
+        r#"$ErrorActionPreference = 'Stop'
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+$action = New-ScheduledTaskAction -Execute {executable_argument} -Argument '--overbar-elevated' -WorkingDirectory {working_directory_argument}
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity
+$trigger.Delay = 'PT3S'
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -DontStopOnIdleEnd -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+$principal = New-ScheduledTaskPrincipal -UserId $identity -LogonType Interactive -RunLevel Highest
+Register-ScheduledTask -TaskName '{TASK_NAME}' -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description 'Launch Overbar at sign-in.' -Force | Out-Null"#
+    );
 
-    let mut delete = Command::new("schtasks.exe");
-    delete.args(["/Delete", "/TN", TASK_NAME, "/F"]);
-    delete.stdout(Stdio::null()).stderr(Stdio::null());
-    hide_child_console(&mut delete);
-    // A missing task is expected on the first click, so deletion failure is safe.
-    let _ = delete.status();
-
-    let task_action = format!("\"{}\" --overbar-elevated", executable.display());
-    let mut create = Command::new("schtasks.exe");
+    let mut create = Command::new("powershell.exe");
     create.args([
-        "/Create",
-        "/TN",
-        TASK_NAME,
-        "/TR",
-        &task_action,
-        "/SC",
-        "ONLOGON",
-        "/RL",
-        "HIGHEST",
-        "/IT",
-        "/F",
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        &script,
     ]);
     create.stdout(Stdio::piped()).stderr(Stdio::piped());
     hide_child_console(&mut create);
@@ -8994,7 +9013,8 @@ fn spawn_title_worker(ctx: Context, running: Arc<AtomicBool>) -> Receiver<String
                     } else {
                         String::new()
                     };
-                    let title = if is_shell_surface_title(&title, &class_name, &process_name)
+                    let title = if !window_manager::is_presentable_application_window(hwnd)
+                        || is_shell_surface_title(&title, &class_name, &process_name)
                         || is_transient_title_surface(hwnd, &class_name)
                     {
                         "Type here to search...".to_owned()
@@ -9720,9 +9740,35 @@ fn configure_windows_search_overlay() {}
 
 #[cfg(target_os = "windows")]
 fn refresh_windows_bar_blur() {
-    // Blur is persistent HWND state and the compositor updates the pixels behind
-    // it automatically. Reapplying the accent policy plus DwmFlush on every
-    // foreground event caused the search-focus flash and could stall animation.
+    use windows::{
+        Win32::{
+            Graphics::{
+                Dwm::DwmFlush,
+                Gdi::{
+                    HRGN, RDW_ALLCHILDREN, RDW_FRAME, RDW_INVALIDATE, RDW_UPDATENOW,
+                    RedrawWindow,
+                },
+            },
+            UI::WindowsAndMessaging::FindWindowW,
+        },
+        core::w,
+    };
+
+    let Ok(bar) = (unsafe { FindWindowW(None, w!("Overbar")) }) else {
+        return;
+    };
+    unsafe {
+        // Invalidate the existing surface without erasing or reapplying the
+        // accent policy. This makes DWM resample the new workspace behind the
+        // acrylic while avoiding the full-bar flash caused by toggling blur.
+        let _ = RedrawWindow(
+            bar,
+            None,
+            HRGN::default(),
+            RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW,
+        );
+        let _ = DwmFlush();
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -9745,7 +9791,12 @@ fn set_windows_overlay_topmost(title: &str, topmost: bool) {
     if let Ok(hwnd) = unsafe { FindWindowW(None, PCWSTR(title.as_ptr())) } {
         let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
         let is_topmost = ex_style & WS_EX_TOPMOST.0 != 0;
-        if is_topmost == topmost {
+        // The style bit is not proof of the HWND's current position inside the
+        // topmost band. Reassert HWND_TOPMOST even when the bit is already set;
+        // foreground/fullscreen transitions can reorder the band without
+        // clearing WS_EX_TOPMOST, which was the source of panels appearing
+        // behind ordinary application windows.
+        if !topmost && !is_topmost {
             return;
         }
         unsafe {
@@ -9988,6 +10039,18 @@ fn configure_overlay_hwnd(
             .is_ok();
         remove_window_from_taskbar(hwnd);
 
+        // Do not rely solely on eframe's WindowLevel hint. Establish the native
+        // topmost-band position as part of configuring every newly-created HWND.
+        let _ = SetWindowPos(
+            hwnd,
+            windows::Win32::UI::WindowsAndMessaging::HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+        );
+
         let dark_mode = BOOL(1);
         let transitions_disabled = BOOL(1);
         let _ = DwmSetWindowAttribute(
@@ -10129,10 +10192,12 @@ unsafe extern "system" fn overlay_window_proc(
         UI::{
             Shell::DefSubclassProc,
             WindowsAndMessaging::{
-                GWL_EXSTYLE, GetClientRect, HTTRANSPARENT, MA_NOACTIVATE, STYLESTRUCT,
-                RemovePropW, WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_NCACTIVATE, WM_NCHITTEST,
-                WM_NCDESTROY, WM_SIZE, WM_STYLECHANGING, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
-                WS_EX_TOOLWINDOW,
+                GWL_EXSTYLE, GetClientRect, HTTRANSPARENT, HWND_TOPMOST, MA_NOACTIVATE,
+                STYLESTRUCT, RemovePropW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+                SWP_NOZORDER, SetWindowPos, WINDOWPOS, WM_ACTIVATEAPP, WM_ERASEBKGND,
+                WM_MOUSEACTIVATE, WM_NCACTIVATE, WM_NCHITTEST, WM_NCDESTROY, WM_SIZE,
+                WM_STYLECHANGING, WM_WINDOWPOSCHANGING, WS_EX_APPWINDOW,
+                WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
             },
         },
     };
@@ -10150,6 +10215,33 @@ unsafe extern "system" fn overlay_window_proc(
             LRESULT(MA_NOACTIVATE as isize)
         }
         WM_ERASEBKGND => LRESULT(1),
+        WM_ACTIVATEAPP if subclass_id != 1 => {
+            // When another process becomes active it may have just inserted a
+            // window above us in the topmost band. Reassert immediately from
+            // the native activation notification instead of waiting for an
+            // egui repaint or polling timer.
+            let _ = unsafe {
+                SetWindowPos(
+                    hwnd,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+                )
+            };
+            unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+        }
+        WM_WINDOWPOSCHANGING if subclass_id != 1 && lparam.0 != 0 => {
+            // Panels must never leave the native topmost band. Mutating the
+            // pending WINDOWPOS also covers z-order changes initiated by winit,
+            // DWM, fullscreen transitions, or another application's activation.
+            let position = unsafe { &mut *(lparam.0 as *mut WINDOWPOS) };
+            position.hwndInsertAfter = HWND_TOPMOST;
+            position.flags &= !SWP_NOZORDER;
+            unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+        }
         WM_NCDESTROY => {
             let _ = unsafe { RemovePropW(hwnd, w!("OverbarOverlayConfigured")) };
             unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
